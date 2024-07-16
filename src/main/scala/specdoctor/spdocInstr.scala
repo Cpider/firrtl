@@ -180,7 +180,14 @@ class SpdocInstr extends Transform {
     ////////////////////////////////////////////////////////////////////////////////
     //           Print Instrumentation Details                                    //
     ////////////////////////////////////////////////////////////////////////////////
-
+    gLedgers.values.foreach(_.extract_ldq)
+    gLedgers.values.foreach(gl =>{
+      println(s"module is: ${gl.mName}}") 
+      gl.ldq_map.foreach(tup => println(s"ldq map: ${tup._1} valid is: {${tup._2}}"))
+      gl.uops_map.foreach(tup => println(s"uops map: ${tup._1} valid is: {${tup._2.mkString(", ")}}"))
+    }
+    
+      )
     if (debug) gLedgers.values.foreach(_.printLog)
     if (debug) mInfos.values.foreach(_.printInfo)
 
@@ -360,6 +367,18 @@ class SpdocInstr extends Transform {
     logger.write(writePretty(parsed_ins_type.map {case (ins, types) => (ins, types)}))
     logger.close()
 
+    // Print the ldq_idx in valid map
+    val mod_ldq_map = gLedgers.values.filter(_.ldq_map.nonEmpty).map(gl => gl.mName -> gl.ldq_map).toMap
+    logger = new PrintWriter(new File(s"${logPath}/${circuit.main}.ldq_map.json"))
+    logger.write(writePretty(mod_ldq_map))
+    logger.close()
+
+    // Print the uop in valid map
+    val mod_uops_map = gLedgers.values.filter(_.uops_map.nonEmpty).map(gl => gl.mName -> gl.uops_map).toMap
+    logger = new PrintWriter(new File(s"${logPath}/${circuit.main}.uops_map.json"))
+    logger.write(writePretty(mod_uops_map))
+    logger.close()
+
     state.copy(circuit)
   }
 
@@ -419,6 +438,7 @@ class SpdocInstr extends Transform {
     var rN2IP = graph.rN2IP
     var rIP2E = graph.rIP2E
     var inst_map = graph.getInstanceMap
+    // var ldq_map : mutable.Map[String, mutable.Set[String]] = mutable.Map.empty.withDefaultValue(mutable.Set.empty)
     // port related with the internal instance module
     var ins_port : mutable.Map[String, mutable.Set[String]] = mutable.Map.empty.withDefaultValue(mutable.Set.empty)
     // var parsed: mutable.Set[String] = parsed
@@ -430,6 +450,18 @@ class SpdocInstr extends Transform {
       if (R.contains(next) && !rN2IP.contains(next)) {
         println(s"sinks: ${next} -----> source: ${R(next)}")
         // println(s"parsed: ${parsed} -----> not_parsed: ${not_parsed}")
+
+        // if (next.contains("uop_ldq_idx")) {
+        //   val parts = next.split("uop_ldq_idx", 2)
+        //   val parts1 = next.split("bits_uop_ldq_idx", 2)
+        //   val prefix = parts(0)
+        //   val prefix1 = parts1(0)
+        //   println(s"prefix is: ${prefix}, ${prefix1}")
+        //   if (R.contains(prefix + "valid"))
+        //   ldq_map.getOrElseUpdate(next, mutable.Set.empty) += prefix + "valid"
+        //   if (R.contains(prefix1 + "valid"))
+        //   ldq_map.getOrElseUpdate(next, mutable.Set.empty) += prefix1 + "valid"
+        // }
           
         if (next.contains("io") && next.contains("valid") && next != sensitive) {
         // if (next.contains("valid") && next != sensitive) {
@@ -503,6 +535,7 @@ class SpdocInstr extends Transform {
       }
       parsed += next
     }
+    // println(s"ldq idx map is: ${ldq_map}")
     (valid_graph, ins_port)
   }
 

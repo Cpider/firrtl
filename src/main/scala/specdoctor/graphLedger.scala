@@ -159,11 +159,23 @@ class Node(val node: FirrtlNode, val name: String) {
 class graphLedger(val module: DefModule) {
   val mName = module.name
   val mPorts = module.ports.toSet
+  val inPorts = mPorts.filter(_.direction == Input)
+  val outPorts = mPorts.filter(_.direction == Output)
 
   private val Nodes = mutable.Map[String, Node]()
   private val G = mutable.Map[String, Set[String]]()
   val R = mutable.Map[String, Set[String]]()
+  val ER = mutable.Map[String, mutable.Map[String, Set[String]]]()
+  val expER = mutable.Map[String, mutable.Map[String, Set[String]]]()
+  val EG = mutable.Map[String, Set[(String, String)]]()
+  val ISigER = mutable.Map[String, mutable.Map[String, Set[String]]]()
   private val expG = mutable.Map[String, Set[String]]()
+  private val expEG = mutable.Map[String, Set[(String, String)]]()
+  val in_out_dep = mutable.Map[String, Set[String]]()
+  val ldq_map = mutable.Map[String, String]()
+  val uops_map = mutable.Map[String, mutable.Set[String]]()
+  var dep_map = mutable.Map[String, Set[(String, String)]]()
+  var Edep_map = mutable.Map[String, Set[(String, String)]]()
 
   // r: reverse, N: node, E: Expression, M: mem, I: instance, P: port, 2: (sink) -> (source)
   val rN2IP = mutable.Map[String, Set[(String, String)]]()
@@ -209,17 +221,32 @@ class graphLedger(val module: DefModule) {
 
     for ((n, _) <- G) {
       val sinks = ListBuffer[String]()
-      this.module foreachStmt findEdge(Nodes(n), sinks)
+      val sinksExpr = ListBuffer[(String, String)]()
+      val srcs = mutable.Map[String, Set[String]]()
+      this.module foreachStmt findEdge(Nodes(n), sinks, sinksExpr, srcs)
       G(n) = sinks.toSet
+      EG(n) = sinksExpr.toSet
+      ER(n) = srcs
 
       expG(n) = Set[String]()
+      expEG(n) = Set[(String, String)]()
+      expER(n) = mutable.Map[String, Set[String]]()
     }
 
     for ((n, _) <- expG) {
       val sinks = ListBuffer[String]()
-      this.module foreachStmt findEdgeExp(Nodes(n), sinks)
+      val sinksExpr = ListBuffer[(String, String)]()
+      val srcs = mutable.Map[String, Set[String]]()
+      this.module foreachStmt findEdgeExp(Nodes(n), sinks, sinksExpr, srcs)
       expG(n) = sinks.toSet
+      expEG(n) = sinksExpr.toSet
+      expER(n) = srcs
     }
+
+    insertIPsrc()
+    dep_map = getPortExpr(ER)
+    Edep_map = getPortExpr(expER)
+    unrollIter(ER, ISigER)
   }
 
   private def reverseG: Unit = {
@@ -239,6 +266,9 @@ class graphLedger(val module: DefModule) {
       val n = Node(s)
       Nodes(n.name) = n
       G(n.name) = Set[String]()
+      EG(n.name) = Set[(String, String)]()
+      ER(n.name) = mutable.Map[String, Set[String]]()
+      if (n.name.endsWith("_T") || n.name.startsWith("_T") || n.name.startsWith("_GEN")) ISigER(n.name) = mutable.Map[String, Set[String]]()
     }
 
     s match {
@@ -248,50 +278,367 @@ class graphLedger(val module: DefModule) {
     }
   }
 
-  private def findEdgeExp(n: Node, sinks: ListBuffer[String])(s: Statement): Unit = {
+  private def findEdgeExp(n: Node, sinks: ListBuffer[String], sinksExpr: ListBuffer[(String, String)], srcs: mutable.Map[String, Set[String]])(s: Statement): Unit = {
     s match {
-      case reg: DefRegister if (n.usedIn(reg.reset, false)) =>
-        sinks.append(reg.name)
-      case nod: DefNode if (n.usedIn(nod.value, false)) =>
-        sinks.append(nod.name)
-      case Connect(_, l, e) if (n.usedIn(e, false)) =>
-        sinks.append(Node.findName(l))
+      case reg: DefRegister =>
+        if (n.usedIn(reg.reset, false)) {
+          sinks.append(reg.name)
+          reg.foreachExpr(expr => sinksExpr.append((reg.name, expr.serialize)))
+        }
+        if (reg.name == n.name) {
+            val src = ListBuffer[String]()
+            getSrc(reg.reset, src, false)
+            srcs(reg.reset.serialize) = src.toSet
+            // println(s"DefRegister ${srcs.mkString(", ")}")
+        }
+        // sinksExpr.append((reg.name, reg.serialize))
+      case nod: DefNode =>
+        if (n.usedIn(nod.value, false)) {
+          sinks.append(nod.name)
+          nod.foreachExpr(expr => sinksExpr.append((nod.name, expr.serialize)))
+        }
+        if (nod.name == n.name) {
+          nod.foreachExpr{expr=>
+            val src = ListBuffer[String]()
+            getSrc(expr, src, false)
+            srcs(expr.serialize) = src.toSet
+            // println(s"DefNode ${srcs.mkString(", ")}")
+          }
+        }
+          
+        // sinksExpr.append((nod.name, nod.serialize))
+      case Connect(_, l, e) =>
+        if (n.usedIn(e, false)) {
+          sinks.append(Node.findName(l))
+          sinksExpr.append((Node.findName(l), e.serialize))
+        }
+        if (Node.findName(l) == n.name) {
+          val src = ListBuffer[String]()
+          getSrc(e, src, false)
+          srcs(e.serialize) = src.toSet
+          // println(s"Connect ${srcs.mkString(", ")}")
+        }
       case _ => Unit
     }
 
-    s foreachStmt findEdgeExp(n, sinks)
+    s foreachStmt findEdgeExp(n, sinks, sinksExpr, srcs)
   }
 
   //noinspection ScalaStyle
   /* Find explicit data flow edges */
-  private def findEdge(n: Node, sinks: ListBuffer[String])(s: Statement): Unit = {
+  private def findEdge(n: Node, sinks: ListBuffer[String], sinksExpr: ListBuffer[(String, String)], srcs: mutable.Map[String, Set[String]])(s: Statement): Unit = {
     s match {
       case reg: DefRegister =>
         if (n.usedIn(reg.reset)) {
           sinks.append(reg.name)
+          reg.foreachExpr(expr => sinksExpr.append((reg.name, expr.serialize)))
+          // sinksExpr.append((reg.name, reg.serialize))
         }
+        if (reg.name == n.name) {
+            val src = ListBuffer[String]()
+            getSrc(reg.reset, src)
+            srcs(reg.reset.serialize) = src.toSet
+            // println(s"DefRegister ${srcs.mkString(", ")}")
+        }
+  
       case nod: DefNode =>
         if (n.usedIn(nod.value)) {
           sinks.append(nod.name)
+          nod.foreachExpr(expr => sinksExpr.append((nod.name, expr.serialize)))
+          // sinksExpr.append((nod.name, nod.serialize))
 
           updateN2XP(nod.name, nod.value, n)
         }
         updateN2E(nod.name, nod.value)
+        if (nod.name == n.name) {
+          nod.foreachExpr{expr=>
+            val src = ListBuffer[String]()
+            getSrc(expr, src)
+            srcs(expr.serialize) = src.toSet
+            // println(s"DefNode ${srcs.mkString(", ")}")
+          }
+        }
       case Connect(_, l, e) =>
         val lName = Node.findName(l)
         if (n.usedIn(e)) {
           sinks.append(lName)
+          sinksExpr.append((lName, e.serialize))
 
           updateN2XP(lName, e, n)
           updateXP2X(lName, l, e, n)
           // updateP2E(lName, e)
         }
         updateN2E(lName, e)
+        if (lName == n.name) {
+          val src = ListBuffer[String]()
+          getSrc(e, src)
+          srcs(e.serialize) = src.toSet
+          // println(s"Connect ${srcs.mkString(", ")}")
+        }
+
       case _ => Unit // Port, DefWire, DefMemory, WDefInstance
     }
 
-    s foreachStmt findEdge(n, sinks)
+    s foreachStmt findEdge(n, sinks, sinksExpr, srcs) 
   }
+
+    //noinspection ScalaStyle
+  /* Check if Node is used for explicit data flow */
+  def getSrc(expr: Expression, srcs: ListBuffer[String], imp: Boolean = true): Unit = expr match {
+    case WRef(refName, _, _, _) => srcs.append(refName)
+    case WSubField(e, ename, _, _) => {
+      // getSrc(e, srcs)
+      // println(s"WSubField ${e.serialize} ${ename}")
+      srcs.append(expr.serialize)
+    }
+    case WSubIndex(e, _, _, _) => {
+      getSrc(e, srcs) // Actually, it is not used in loFirrtl
+      println(s"WSubIndex ${expr.serialize}")
+    }
+    case WSubAccess(e, _, _, _) => {
+      getSrc(e, srcs) // This too
+      println(s"WSubAccess ${expr.serialize}")
+    }
+    
+    case Reference(refName, _, _, _) => srcs.append(refName)
+    case SubField(e, ename, _, _) => {
+      getSrc(e, srcs)
+      println(s"SubField ${expr.serialize} ${ename}")
+    }
+    case SubIndex(e, _, _, _) => {
+      getSrc(e, srcs)
+      println(s"SubIndex ${expr.serialize}")
+    }
+    case SubAccess(e, _, _, _) => {
+      getSrc(e, srcs)
+      println(s"SubAccess ${expr.serialize}")
+    }
+    case Mux(cond, tval, fval, _) =>
+      if (imp) {
+        getSrc(cond, srcs)
+        getSrc(tval, srcs)
+        getSrc(fval, srcs)
+      } // Catch implicit data flow
+      else {
+        getSrc(tval, srcs)
+        getSrc(fval, srcs)
+      }
+    case DoPrim(_, args, _, _) => {
+      for (arg <- args) {
+        getSrc(arg, srcs)
+      }
+    }
+    case _ => Unit
+  }
+
+  def unrollIter(RExpr: mutable.Map[String, mutable.Map[String, Set[String]]], ISigExpr: mutable.Map[String, mutable.Map[String, Set[String]]]): Unit = {
+    val ISigs = ISigExpr.keySet
+    ISigs foreach { isig =>
+      val visited = ListBuffer[String]()
+      val in_parse = mutable.Set[String]()
+      val op_expr = new StringBuilder()
+      RExpr(isig).foreach {
+        case (expr, signals) => 
+          op_expr.append(expr)
+          for (sig <- signals) {
+            if (sig.startsWith("_GEN") || sig.endsWith("_T") || sig.startsWith("_T"))
+            in_parse += sig
+          }
+      }
+      while (!in_parse.isEmpty) {  
+        val parse = in_parse.head
+        // if (mName.contains("LSU"))
+        // println(s"parse is: ${parse}, visit is: ${visited}")
+        if (!visited.contains(parse)) {
+          visited += parse
+          in_parse -= parse
+          // println(s"parse ${parse}")
+          if (!ISigExpr(parse).isEmpty) {
+            // val repl = ISigExpr(parse).head._1
+            visited ++= ISigExpr(parse).head._2.filter(visit => !in_parse.contains(visit))
+            // println(s"op_expr ${op_expr}")
+            // replaceAll(op_expr, parse, repl)
+            // println(s"ISigExpr ${repl} ${parse} ${visited.size} ${in_parse.size}")
+          }
+          else if (RExpr(parse).size != 0) {
+            var key = ""
+            RExpr(parse).foreach {
+              case (expr, sigs) =>
+              if (!sigs.isEmpty) {
+                key = expr
+                for (sig <- sigs) {
+                  if (!visited.contains(sig) && (sig.startsWith("_GEN") || sig.endsWith("_T") || sig.startsWith("_T"))){
+                    in_parse += sig
+                    // println(s"size: ${in_parse.size}, ${sig}")
+                  }
+                }
+              }
+            }
+            replaceAll(op_expr, parse, key)
+            // println(s"inparse ${in_parse.size} visited ${visited.size}")
+          }
+        }
+      }
+      // println(s"isig ${isig} op_expr ${op_expr.size} is: ${op_expr} ,visited ${visited.size}")
+      ISigExpr(isig) += (op_expr.toString -> visited.toSet)
+    }
+  }
+
+  def replaceAll(op_expr: StringBuilder, repl: String, dest: String): Unit = {
+    var index = op_expr.indexOf(repl)
+    var nextChar = ' '
+    while (index != -1) {
+      if (index + repl.length != op_expr.length && index != -1) 
+      nextChar = op_expr.charAt(index + repl.length)
+      if (nextChar.isDigit || nextChar == '_') {
+        index = op_expr.indexOf(repl, index + repl.length)
+        if (index + repl.length != op_expr.length && index != -1) 
+        nextChar = op_expr.charAt(index + repl.length)
+      }
+      else {
+        op_expr.replace(index, index + repl.length, dest)
+        index = op_expr.indexOf(repl, index + repl.length)
+        // println(s"op_expr ${op_expr.size}: ${op_expr} ${index} ${parse}")
+        if (index + repl.length != op_expr.length && index != -1) 
+        nextChar = op_expr.charAt(index + repl.length)
+      }
+      // println(s"${mName} op_expr ${op_expr.size}: ${repl} ${index} ${repl.length} ${dest.size}")
+    }
+  }
+
+  def insertIPsrc(): Unit = {
+    rIP2E.foreach{
+      case ((ins, port), expr) =>
+        val srcs = ListBuffer[String]()
+        getSrc(expr, srcs)
+        if (ER.contains(ins + "." + port)) 
+        ER(ins + "." + port) += (expr.serialize -> srcs.toSet)
+        else {
+          ER(ins + "." + port) = mutable.Map[String, Set[String]]()
+          ER(ins + "." + port) += (expr.serialize -> srcs.toSet)
+        }
+    }
+  }
+
+  def getPortExpr(RExpr: mutable.Map[String, mutable.Map[String, Set[String]]]): mutable.Map[String, Set[(String, String)]] = {
+    val inValid = inPorts.filter(_.name.contains("valid")).map(p => p.name)
+    val outValid = outPorts.filter(_.name.contains("valid")).map(p => p.name)
+    var dep = mutable.Map[String, Set[(String, String)]]()
+    // val inDepPath = inValid foreach getDepPath
+    // println(s"outValid is: ${outValid}, inValid is: ${inValid}")
+    outValid foreach {  valid =>  
+      val visited = ListBuffer[String]()
+      val in_parse = mutable.Set[String]()
+      val op_expr = new StringBuilder()
+      RExpr(valid).foreach {
+        case (expr, signals) => 
+          op_expr.append(expr)
+          in_parse ++= signals.toList
+      }
+      println(s"${mName} initial op_expr is: ${op_expr}")
+      while (!in_parse.isEmpty) {  
+        val parse = in_parse.head
+        // if (mName.contains("LSU"))
+        // println(s"parse is: ${parse}, visit is: ${visited}")
+        if (!visited.contains(parse)) {
+          visited += parse
+          in_parse -= parse
+          if (parse.contains('.')) {
+            val newTuple = (parse, op_expr.toString())
+            dep = dep + (valid -> (dep.getOrElse(valid, Set()) + newTuple))
+            
+            if (RExpr.contains(parse)) {
+              // if (mName.contains("LSU"))
+              // println(s"ER port ${parse} size is: ${ER(parse).size}")
+              var key = ""
+              RExpr(parse).foreach {
+                case (expr, sigs) =>
+                if (!sigs.isEmpty) {
+                  key = expr
+                  for (sig <- sigs) {
+                    if (!visited.contains(sig)){
+                      in_parse += sig
+                    }
+                  }    
+                }
+              }
+              var index = op_expr.indexOf(parse)
+              // while (index >= 0) {
+                op_expr.replace(index, index + parse.length, key)
+                // index = op_expr.indexOf(parse, index + key.length)
+              // }
+              // if (mName.contains("LSU"))
+              // println(s"op_expr is: ${op_expr}, key is: ${key}")
+            }
+          }
+          else if(inValid.contains(parse)) {
+            val newTuple = (parse, op_expr.toString())
+            dep = dep + (valid -> (dep.getOrElse(valid, Set()) + newTuple))
+          }
+          else if(outValid.filter(!_.contains(valid)).contains(parse)) {
+            val newTuple = (parse, op_expr.toString())
+            dep = dep + (valid -> (dep.getOrElse(valid, Set()) + newTuple))
+          }
+          else {
+            if (RExpr(parse).size != 0) {
+              // if (mName.contains("LSU"))
+              // println(s"ER sig ${parse} size is: ${ER(parse).size}")
+              
+              var key = ""
+              RExpr(parse).foreach {
+                case (expr, sigs) =>
+                if (!sigs.isEmpty) {
+                  key = expr
+                  for (sig <- sigs) {
+                    if (!visited.contains(sig)){
+                      in_parse += sig
+                    }
+                  }
+                }
+              }
+              var index = op_expr.indexOf(parse)
+              var nextChar = ' '
+              if (index + parse.length != op_expr.length) 
+              nextChar = op_expr.charAt(index + parse.length)
+              while ((nextChar.isDigit || nextChar == '_') && index != -1) {
+                index = op_expr.indexOf(parse, index + parse.length)
+                nextChar = op_expr.charAt(index + parse.length)
+              }
+                // println(s"op_expr is: ${op_expr}, key is: ${key}")
+              if (index != -1)
+                op_expr.replace(index, index + parse.length, key)
+              
+              
+                // index = op_expr.indexOf(parse, index + key.length)
+              // }
+              // if (mName.contains("LSU"))
+              // println(s"op_expr is: ${op_expr}, key is: ${key}")
+            }
+          }
+        }  
+         
+        // if (mName.contains("Rob")){
+        //   // println(s"op_expr size is: ${op_expr.size}, op_expr is: ${op_expr}")
+        //   // println(s"visited size is: ${visited.size}. is: ${visited.mkString(", ")}")
+        //   // println(s"in_parse size is: ${in_parse.size}. is: ${in_parse.mkString(", ")}")
+        //   println(s"op_expr size is: ${op_expr.size}")
+        //   println(s"visited size is: ${visited.size}")
+        //   println(s"in_parse size is: ${in_parse.size}")
+        // }
+        
+      }
+      // println(s"op_expr size is: ${op_expr.size}, op_expr is: ${op_expr}") 
+      op_expr.delete(0, op_expr.length)
+    }
+    println(s"module is: ${mName} dep is: ${dep}")
+    dep
+  }
+
+  // def getDepPath(src: String, sinks: Set[String]): Map[String, Set[String]] = {
+  //   val visited = mutable.Set[String]()
+  //   val notVisited = mutable.Set[String]() + src
+
+  // }
 
   // rN2IP, rN2MP update
   private def updateN2XP(sink: String, srcE: Expression, node: Node): Unit = {
@@ -664,28 +1011,103 @@ class graphLedger(val module: DefModule) {
       case (s, n) => Seq("DefRegister", "DefMemory").contains(n.c)
     }.keySet.diff(outNames).toSet
   }
+  
+  def extract_ldq: Unit = {
+    R.foreach {tup => 
+      if (tup._1.contains("uop_ldq_idx")) {
+      val parts = tup._1.split("uop_ldq_idx", 2)
+      val parts1 = tup._1.split("bits_uop_ldq_idx", 2)
+      val prefix = parts(0)
+      val prefix1 = parts1(0)
+      println(s"prefix is: ${prefix}, ${prefix1}")
+      if (R.contains(prefix + "valid"))
+        ldq_map(tup._1) = prefix + "valid"
+      if (R.contains(prefix1 + "valid"))
+        ldq_map(tup._1) = prefix1 + "valid"
+    }
+      if (tup._1.contains("valid")) {
+        val prefix = tup._1.split("valid", 2)(0)
+        uops_map(tup._1) = mutable.Set() ++ R.keySet.filter(str => str.contains(prefix+"bits_uop")) ++ R.filterKeys(_.contains(prefix + "uop")).keySet
+      } 
+    }
+  }
 
   /******************** Print functions ******************************************/
   def printLog: Unit = {
     println(s"====================$mName=========================")
 
-    println("---------R---------")
+    println(s"---------${mName} R---------")
     R.foreach(tup => println(s"[${tup._1}] -- {${tup._2.mkString(", ")}}"))
     println("")
 
-    println("---------rN2IP---------")
+    println(s"---------${mName} ER---------")
+    // ER.foreach(tup => println(s"[${tup._1}] -- {${tup._2.foreach(src=>" (" + src.mkString(", ") + ") ")}}"))
+    ER.foreach(tup => {
+      // Extract the key and value from the tuple
+      val key = tup._1
+      val value = tup._2
+
+      // Use string interpolation to print the key and value
+      println(s"[${key}] -- ${tup._2.size} {")
+      
+      // Iterate over the inner set of strings and print each set surrounded by parentheses
+      value.foreach{case(expr, src) => println(s"${expr} => ${src.mkString(", ")}")}
+      
+      // Close the curly brace for the value and the square bracket for the key
+      println("}")
+    })
+    println("")
+
+    println(s"---------${mName} input---------")
+    println(s"size: ${inPorts.size} [${inPorts.map(tup => tup.name).mkString(", ")}]}")
+    println("")
+
+    println(s"---------${mName} output---------")
+    println(s"size: ${outPorts.size} [${outPorts.map(tup => tup.name).mkString(", ")}]}")
+    println("")
+
+    println(s"---------${mName} DEP---------")
+    dep_map.foreach(tup => println(s"[${tup._1}] ${tup._2.size} -- {${tup._2.map(x => s"(${x._1}: ${x._2})").mkString("\n")}}"))
+    println("")
+
+    println(s"---------${mName} EDEP---------")
+    Edep_map.foreach(tup => println(s"[${tup._1}] ${tup._2.size} -- {${tup._2.map(x => s"(${x._1}: ${x._2})").mkString("\n")}}"))
+    println("")
+
+    println(s"---------${mName} ISUNROLL---------")
+    println(s"${ISigER.size}")
+    ISigER.foreach(tup => println(s"[${tup._1}] -- {${tup._2.map{case(expr, srcs) => s"(${expr}: ${srcs.size} \n ${srcs.mkString(", ")})"}}}"))
+    println("")
+
+    println(s"---------${mName} G---------")
+    G.foreach(tup => println(s"[${tup._1}] -- {${tup._2.mkString(", ")}}"))
+    println("")
+
+    println(s"---------${mName} EG---------")
+    EG.foreach(tup => println(s"[${tup._1}] -- {${tup._2.mkString(", ")}}"))
+    println("")
+
+    println(s"---------${mName} expEG---------")
+    expEG.foreach(tup => println(s"[${tup._1}] -- {${tup._2.mkString(", ")}}"))
+    println("")
+
+    println(s"---------${mName} expG---------")
+    expG.foreach(tup => println(s"[${tup._1}] -- {${tup._2.mkString(", ")}}"))
+    println("")
+
+    println(s"---------${mName} rN2IP---------")
     rN2IP.foreach(tup => println(s"[${tup._1}] -- {${tup._2.map(x => s"(${x._1}, ${x._2})").mkString(", ")}}"))
     println("")
 
-    println("---------rIP2E---------")
+    println(s"---------${mName} rIP2E---------")
     rIP2E.foreach(tup => println(s"${tup._1} -- {${tup._2.serialize}}"))
     println("")
 
-    println("---------rN2MP---------")
+    println(s"---------${mName} rN2MP---------")
     rN2MP.foreach(tup => println(s"[${tup._1}] -- {${tup._2.map(x => s"(${x._1}, ${x._2})").mkString(", ")}}"))
     println("")
 
-    println("---------rMP2N---------")
+    println(s"---------${mName} rMP2N---------")
     rMP2N.foreach{ case (k, v) => println(s"[(${k._1}, ${k._2})] -- {${v.mkString(", ")}}")}
     println("")
   }
