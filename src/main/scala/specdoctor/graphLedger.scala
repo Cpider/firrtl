@@ -22,6 +22,7 @@ import firrtl.ir._
 import scala.reflect.ClassTag
 import scala.collection.mutable.ListBuffer
 import scala.collection.mutable
+import java.{util => ju}
 
 
 // graphLedger sweeps fir file, build graphs of elements
@@ -165,17 +166,23 @@ class graphLedger(val module: DefModule) {
   private val Nodes = mutable.Map[String, Node]()
   private val G = mutable.Map[String, Set[String]]()
   val R = mutable.Map[String, Set[String]]()
-  val ER = mutable.Map[String, mutable.Map[String, Set[String]]]()
-  val expER = mutable.Map[String, mutable.Map[String, Set[String]]]()
-  val EG = mutable.Map[String, Set[(String, String)]]()
+  val ER = mutable.Map[String, mutable.Map[Expression, Set[String]]]()
+  var LoopER = Map[String, mutable.Map[Expression, Set[String]]]()
+  val expER = mutable.Map[String, mutable.Map[Expression, Set[String]]]()
+  val EG = mutable.Map[String, Set[(String, Expression)]]()
+  val NT = mutable.Map[String, String]()
   val ISigER = mutable.Map[String, mutable.Map[String, Set[String]]]()
+  val SigV = mutable.Map[String, Int]()
+  val SigInV = mutable.Map[String, mutable.Map[String, Int]]()
   private val expG = mutable.Map[String, Set[String]]()
-  private val expEG = mutable.Map[String, Set[(String, String)]]()
+  private val expEG = mutable.Map[String, Set[(String, Expression)]]()
   val in_out_dep = mutable.Map[String, Set[String]]()
   val ldq_map = mutable.Map[String, String]()
   val uops_map = mutable.Map[String, mutable.Set[String]]()
   var dep_map = mutable.Map[String, Set[(String, String)]]()
   var Edep_map = mutable.Map[String, Set[(String, String)]]()
+  var IinPorts = Set[String]()
+  var IoutPorts = Set[String]()
 
   // r: reverse, N: node, E: Expression, M: mem, I: instance, P: port, 2: (sink) -> (source)
   val rN2IP = mutable.Map[String, Set[(String, String)]]()
@@ -221,22 +228,22 @@ class graphLedger(val module: DefModule) {
 
     for ((n, _) <- G) {
       val sinks = ListBuffer[String]()
-      val sinksExpr = ListBuffer[(String, String)]()
-      val srcs = mutable.Map[String, Set[String]]()
+      val sinksExpr = ListBuffer[(String, Expression)]()
+      val srcs = mutable.Map[Expression, Set[String]]()
       this.module foreachStmt findEdge(Nodes(n), sinks, sinksExpr, srcs)
       G(n) = sinks.toSet
       EG(n) = sinksExpr.toSet
       ER(n) = srcs
 
       expG(n) = Set[String]()
-      expEG(n) = Set[(String, String)]()
-      expER(n) = mutable.Map[String, Set[String]]()
+      expEG(n) = Set[(String, Expression)]()
+      expER(n) = mutable.Map[Expression, Set[String]]()
     }
 
     for ((n, _) <- expG) {
       val sinks = ListBuffer[String]()
-      val sinksExpr = ListBuffer[(String, String)]()
-      val srcs = mutable.Map[String, Set[String]]()
+      val sinksExpr = ListBuffer[(String, Expression)]()
+      val srcs = mutable.Map[Expression, Set[String]]()
       this.module foreachStmt findEdgeExp(Nodes(n), sinks, sinksExpr, srcs)
       expG(n) = sinks.toSet
       expEG(n) = sinksExpr.toSet
@@ -247,6 +254,8 @@ class graphLedger(val module: DefModule) {
     dep_map = getPortExpr(ER)
     Edep_map = getPortExpr(expER)
     unrollIter(ER, ISigER)
+    LoopER = getLoopExpr(ER)
+    getInstPort
   }
 
   private def reverseG: Unit = {
@@ -266,8 +275,8 @@ class graphLedger(val module: DefModule) {
       val n = Node(s)
       Nodes(n.name) = n
       G(n.name) = Set[String]()
-      EG(n.name) = Set[(String, String)]()
-      ER(n.name) = mutable.Map[String, Set[String]]()
+      EG(n.name) = Set[(String, Expression)]()
+      ER(n.name) = mutable.Map[Expression, Set[String]]()
       if (n.name.endsWith("_T") || n.name.startsWith("_T") || n.name.startsWith("_GEN")) ISigER(n.name) = mutable.Map[String, Set[String]]()
     }
 
@@ -278,30 +287,30 @@ class graphLedger(val module: DefModule) {
     }
   }
 
-  private def findEdgeExp(n: Node, sinks: ListBuffer[String], sinksExpr: ListBuffer[(String, String)], srcs: mutable.Map[String, Set[String]])(s: Statement): Unit = {
+  private def findEdgeExp(n: Node, sinks: ListBuffer[String], sinksExpr: ListBuffer[(String, Expression)], srcs: mutable.Map[Expression, Set[String]])(s: Statement): Unit = {
     s match {
       case reg: DefRegister =>
         if (n.usedIn(reg.reset, false)) {
           sinks.append(reg.name)
-          reg.foreachExpr(expr => sinksExpr.append((reg.name, expr.serialize)))
+          reg.foreachExpr(expr => sinksExpr.append((reg.name, expr)))
         }
         if (reg.name == n.name) {
             val src = ListBuffer[String]()
             getSrc(reg.reset, src, false)
-            srcs(reg.reset.serialize) = src.toSet
+            srcs(reg.reset) = src.toSet
             // println(s"DefRegister ${srcs.mkString(", ")}")
         }
         // sinksExpr.append((reg.name, reg.serialize))
       case nod: DefNode =>
         if (n.usedIn(nod.value, false)) {
           sinks.append(nod.name)
-          nod.foreachExpr(expr => sinksExpr.append((nod.name, expr.serialize)))
+          nod.foreachExpr(expr => sinksExpr.append((nod.name, expr)))
         }
         if (nod.name == n.name) {
           nod.foreachExpr{expr=>
             val src = ListBuffer[String]()
             getSrc(expr, src, false)
-            srcs(expr.serialize) = src.toSet
+            srcs(expr) = src.toSet
             // println(s"DefNode ${srcs.mkString(", ")}")
           }
         }
@@ -310,12 +319,15 @@ class graphLedger(val module: DefModule) {
       case Connect(_, l, e) =>
         if (n.usedIn(e, false)) {
           sinks.append(Node.findName(l))
-          sinksExpr.append((Node.findName(l), e.serialize))
+          if (instances.map(_.name).contains(Node.findName(l)))
+            sinksExpr.append((l.serialize, e))
+          else
+            sinksExpr.append((Node.findName(l), e))
         }
         if (Node.findName(l) == n.name) {
           val src = ListBuffer[String]()
           getSrc(e, src, false)
-          srcs(e.serialize) = src.toSet
+          srcs(e) = src.toSet
           // println(s"Connect ${srcs.mkString(", ")}")
         }
       case _ => Unit
@@ -326,25 +338,25 @@ class graphLedger(val module: DefModule) {
 
   //noinspection ScalaStyle
   /* Find explicit data flow edges */
-  private def findEdge(n: Node, sinks: ListBuffer[String], sinksExpr: ListBuffer[(String, String)], srcs: mutable.Map[String, Set[String]])(s: Statement): Unit = {
+  private def findEdge(n: Node, sinks: ListBuffer[String], sinksExpr: ListBuffer[(String, Expression)], srcs: mutable.Map[Expression, Set[String]])(s: Statement): Unit = {
     s match {
       case reg: DefRegister =>
         if (n.usedIn(reg.reset)) {
           sinks.append(reg.name)
-          reg.foreachExpr(expr => sinksExpr.append((reg.name, expr.serialize)))
+          reg.foreachExpr(expr => sinksExpr.append((reg.name, expr)))
           // sinksExpr.append((reg.name, reg.serialize))
         }
         if (reg.name == n.name) {
             val src = ListBuffer[String]()
             getSrc(reg.reset, src)
-            srcs(reg.reset.serialize) = src.toSet
+            srcs(reg.reset) = src.toSet
             // println(s"DefRegister ${srcs.mkString(", ")}")
         }
   
       case nod: DefNode =>
         if (n.usedIn(nod.value)) {
           sinks.append(nod.name)
-          nod.foreachExpr(expr => sinksExpr.append((nod.name, expr.serialize)))
+          nod.foreachExpr(expr => sinksExpr.append((nod.name, expr)))
           // sinksExpr.append((nod.name, nod.serialize))
 
           updateN2XP(nod.name, nod.value, n)
@@ -354,25 +366,29 @@ class graphLedger(val module: DefModule) {
           nod.foreachExpr{expr=>
             val src = ListBuffer[String]()
             getSrc(expr, src)
-            srcs(expr.serialize) = src.toSet
+            srcs(expr) = src.toSet
             // println(s"DefNode ${srcs.mkString(", ")}")
           }
         }
       case Connect(_, l, e) =>
-        val lName = Node.findName(l)
+        // l是instance的输入端口或者是模块的输入端口。e可能是模块output端口或者是内部变量。
+        val lName = Node.findName(l) // lName可能是模块名或者是内部output名。
         if (n.usedIn(e)) {
           sinks.append(lName)
-          sinksExpr.append((lName, e.serialize))
-
-          updateN2XP(lName, e, n)
-          updateXP2X(lName, l, e, n)
+          if (instances.map(_.name).contains(lName))
+            sinksExpr.append((l.serialize, e))
+          else {
+            sinksExpr.append((lName, e)) // 如果lName是模块名，G可能缺少了完整的变量。但是表达式没问题。
+          }
+          updateN2XP(lName, e, n)  // 如果n是模块名，即src是一个模块的output端口，则加入到rn2ip中，但是如果sink是模块input，lname是模块，只保存了模块。
+          updateXP2X(lName, l, e, n)   //如果lname是模块，则保留（ins, output）和表达式。
           // updateP2E(lName, e)
         }
         updateN2E(lName, e)
-        if (lName == n.name) {
+        if (lName == n.name) {  // ER只有lName是模块的时候的sink是模块名的source，source和expr没问题。
           val src = ListBuffer[String]()
           getSrc(e, src)
-          srcs(e.serialize) = src.toSet
+          srcs(e) = src.toSet
           // println(s"Connect ${srcs.mkString(", ")}")
         }
 
@@ -431,7 +447,255 @@ class graphLedger(val module: DefModule) {
     case _ => Unit
   }
 
-  def unrollIter(RExpr: mutable.Map[String, mutable.Map[String, Set[String]]], ISigExpr: mutable.Map[String, mutable.Map[String, Set[String]]]): Unit = {
+  def getLoopExpr(ER: mutable.Map[String, mutable.Map[Expression, Set[String]]]): Map[String, mutable.Map[Expression, Set[String]]] = {
+    ER.flatMap { case (dst, srcs) =>
+    var loop = false
+    srcs.foreach { case (expr, sigs) =>
+      if (sigs.contains(dst)) loop = true
+    }
+    if (loop) Some(dst -> srcs)
+    else None
+  }.toMap
+  }
+
+//  def calculateValue(exprg: mutable.Map[String, Set[(String, Expression)]]): Unit = {
+//    val inValid = inPorts.filter(_.name.contains("valid")).map(p => p.name)
+//    val outValid = outPorts.filter(_.name.contains("valid")).map(p => p.name)
+//    // Get the instance of this module and the port relationship with the port. Such as instance module out impact the out. in impact to instance input.
+//
+//    val parse_sig = mutable.Set[String]()
+//    val not_parsed = mutable.Set[String]() ++ inValid
+//    while (!not_parsed.isEmpty) {
+//      val parse = not_parsed.head
+//      if (!parse_sig.contains(parse)) {
+//        parse_sig += parse
+//        not_parsed -= parse
+//
+//      }
+//    }
+//
+//  }
+
+  object OpMask extends Enumeration {
+    type value = Value
+    val MuxCond =  Value(1 << 1)
+    val MuxTval = Value(1 << 2)
+    val MuxFval = Value(1 << 3)
+    val OpAnd = Value(1 << 4)
+    val OpNot = Value(1 << 5)
+    val OpNeq = Value(1 << 6)
+    val OpEq = Value(1 << 7)
+    val OpOr =  Value(1 << 8)
+    val OpXor = Value(1 << 9)
+    val OpElse = Value(1 << 10)
+  }
+
+  def propValue(src: String, sink: String, expr: Expression, invalue: mutable.Map[String, mutable.Map[String, Int]], sigvalue: mutable.Map[String, Int]): Unit = expr match {
+    case Mux(cond, tval, fval, _) =>
+      if (!cond.isInstanceOf[Reference]) {
+        propValue(src, cond.serialize, cond, invalue, sigvalue)
+        if (sigvalue.getOrElse(cond.serialize, 3) != 3)  {
+          SigInV.getOrElse(src, mutable.Map[String, Int]()).foreach {
+            case (input, score) =>
+              invalue(sink).update(input, score | OpMask.MuxCond.id)
+          }
+          sigvalue(sink) = 2
+        }
+      }
+      else {
+        if (cond.serialize == src) {
+          SigInV.getOrElse(src, mutable.Map[String, Int]()).foreach {
+            case (input, score) =>
+              invalue(sink).update(input, score | OpMask.MuxCond.id)
+          }
+          sigvalue(sink) = 2
+        }
+      }
+      if (!tval.isInstanceOf[Reference]) {
+        propValue(src, tval.serialize, cond, invalue, sigvalue)
+        if (sigvalue.getOrElse(tval.serialize, 3) != 3)  {
+          SigInV.getOrElse(src, mutable.Map[String, Int]()).foreach {
+            case (input, score) =>
+              invalue(sink).update(input, score | OpMask.MuxCond.id)
+          }
+          sigvalue(sink) = 1
+        }
+      }
+      else {
+        if (tval.serialize == src) {
+          SigInV.getOrElse(src, mutable.Map[String, Int]()).foreach {
+            case (input, score) =>
+              invalue(sink).update(input, score | OpMask.MuxTval.id)
+          }
+          sigvalue(sink) = 1
+        }
+      }
+    if (!fval.isInstanceOf[Reference]) {
+      propValue(src, fval.serialize, cond, invalue, sigvalue)
+      if (sigvalue.getOrElse(fval.serialize, 3) != 3) {
+        SigInV.getOrElse(src, mutable.Map[String, Int]()).foreach {
+          case (input, score) =>
+            invalue(sink).update(input, score | OpMask.MuxFval.id)
+        }
+        sigvalue(sink) = 1
+      }
+    }
+    else  {
+      if (fval.serialize == src) {
+        SigInV.getOrElse(src, mutable.Map[String, Int]()).foreach {
+          case (input, score) =>
+            invalue(sink).update(input, score | OpMask.MuxFval.id)
+        }
+        sigvalue(sink) = 1
+      }
+    }
+
+    case DoPrim(op, args, _, _) =>
+      op match {
+        case PrimOps.And =>
+          //          val argsrc = if (args.head.serialize == src) args.head else args(1)
+          val argsname = args.filter(_.isInstanceOf[Reference]).map(_.asInstanceOf[Reference].name)
+          if (argsname.contains(src)) {
+            SigInV.getOrElse(src, mutable.Map[String, Int]()).foreach {
+              case (input, score) =>
+                invalue(sink).update(input, score | OpMask.OpAnd.id)
+            }
+            sigvalue(sink) = 1
+          }
+
+        case PrimOps.Not =>
+          val argsname = args.filter(_.isInstanceOf[Reference]).map(_.asInstanceOf[Reference].name)
+          if (argsname.contains(src)) {
+            args.foreach { arg =>
+              if (arg.serialize == src) {
+                SigInV.getOrElse(src, mutable.Map[String, Int]()).foreach {
+                  case (input, score) =>
+                    invalue(sink).update(input, score | OpMask.OpNot.id)
+                }
+                sigvalue(sink) = 0
+              }
+            }
+          }
+
+        // case Neq => {
+        //   args.foreachExpr {arg =>
+        //     if (arg.serialize == src) {
+        //       scoresig(sink) += scoresig.getOrElse(sink, mutable.Map[String, Int]()).map {
+        //         case (I, S) =>
+        //         (I, S | OpMask.OpNeq.id)
+        //       }
+        //     }
+        //   }
+        // }
+
+        case PrimOps.Eq =>
+          val argsname = args.filter(_.isInstanceOf[Reference]).map(_.asInstanceOf[Reference].name)
+          if (argsname.contains(src)) {
+            val argcmp = if (args.head.serialize != src) args.head else args(1)
+            argcmp match {
+              case UIntLiteral(vint, _)  =>
+                if (vint > 0) {
+                  SigInV.getOrElse(src, mutable.Map[String, Int]()).foreach {
+                    case (input, score) =>
+                      invalue(sink).update(input, score | OpMask.OpEq.id)
+                  }
+                  sigvalue(sink) = 1
+                }
+                else sigvalue(sink) = 0
+
+              case SIntLiteral(vint, _) =>
+                if (vint > 0) {
+                  SigInV.getOrElse(src, mutable.Map[String, Int]()).foreach {
+                    case (input, score) =>
+                      invalue(sink).update(input, score | OpMask.OpEq.id)
+                  }
+                  sigvalue(sink) = 1
+                }
+                else sigvalue(sink) = 0
+
+              case _ =>
+                if (SigV.getOrElse(src, 0) != 0) {
+                  SigInV.getOrElse(src, mutable.Map[String, Int]()).foreach {
+                    case (input, score) =>
+                      if (score > 0)
+                        invalue(sink).update(input, score | OpMask.OpEq.id)
+                  }
+                  sigvalue(sink) = 1
+                }
+                else
+                  sigvalue(sink) = 0
+            }
+          }
+
+        case PrimOps.Or =>
+          val argsname = args.filter(_.isInstanceOf[Reference]).map(_.asInstanceOf[Reference].name)
+          if (argsname.contains(src)) {
+            SigInV.getOrElse(src, mutable.Map[String, Int]()).foreach {
+              case (input, score) =>
+                invalue(sink).update(input, score | OpMask.OpOr.id)
+            }
+            sigvalue(sink) = 1
+          }
+
+        case PrimOps.Xor =>
+          val argsname = args.filter(_.isInstanceOf[Reference]).map(_.asInstanceOf[Reference].name)
+          if (argsname.contains(src)) {
+            val argcmp = if (args.head.serialize != src) args.head else args(1)
+            argcmp match {
+              case UIntLiteral(vint, _)  =>
+                if (vint == 0) {
+                  SigInV.getOrElse(src, mutable.Map[String, Int]()).foreach {
+                    case (input, score) =>
+                      invalue(sink).update(input, score | OpMask.OpEq.id)
+                  }
+                  sigvalue(sink) = 1
+                }
+                else sigvalue(sink) = 0
+
+              case SIntLiteral(vint, _) =>
+                if (vint == 0) {
+                  SigInV.getOrElse(src, mutable.Map[String, Int]()).foreach {
+                    case (input, score) =>
+                      invalue(sink).update(input, score | OpMask.OpEq.id)
+                  }
+                  sigvalue(sink) = 1
+                }
+                else sigvalue(sink) = 0
+
+              case _ =>
+                if (SigV.getOrElse(src, 0) == 0) {
+                  SigInV.getOrElse(src, mutable.Map[String, Int]()).foreach {
+                    case (input, score) =>
+                      if (score == 0)
+                        invalue(sink).update(input, score | OpMask.OpEq.id)
+                  }
+                  sigvalue(sink) = 1
+                }
+                else sigvalue(sink) = 0
+            }
+          }
+
+        case _ =>
+          val argsname = args.filter(_.isInstanceOf[Reference]).map(_.asInstanceOf[Reference].name)
+          if (argsname.contains(src)) {
+                SigInV.getOrElse(src, mutable.Map[String, Int]()).foreach {
+                  case (input, score) =>
+                    invalue(sink).update(input, score | OpMask.OpElse.id)
+                }
+                sigvalue(sink) = 1
+              }
+      }
+
+//    case Reference(name, _, _, _) =>
+//      if (name == src) {
+//        (src, sigvalue(src))
+//      }
+//      else ()
+
+    case _ => Unit
+  }
+
+  def unrollIter(RExpr: mutable.Map[String, mutable.Map[Expression, Set[String]]], ISigExpr: mutable.Map[String, mutable.Map[String, Set[String]]]): Unit = {
     val ISigs = ISigExpr.keySet
     ISigs foreach { isig =>
       val visited = ListBuffer[String]()
@@ -439,13 +703,13 @@ class graphLedger(val module: DefModule) {
       val op_expr = new StringBuilder()
       RExpr(isig).foreach {
         case (expr, signals) => 
-          op_expr.append(expr)
+          op_expr.append(expr.serialize)
           for (sig <- signals) {
             if (sig.startsWith("_GEN") || sig.endsWith("_T") || sig.startsWith("_T"))
             in_parse += sig
           }
       }
-      while (!in_parse.isEmpty) {  
+      while (in_parse.nonEmpty) {
         val parse = in_parse.head
         // if (mName.contains("LSU"))
         // println(s"parse is: ${parse}, visit is: ${visited}")
@@ -453,19 +717,19 @@ class graphLedger(val module: DefModule) {
           visited += parse
           in_parse -= parse
           // println(s"parse ${parse}")
-          if (!ISigExpr(parse).isEmpty) {
+          if (ISigExpr(parse).nonEmpty) {
             // val repl = ISigExpr(parse).head._1
             visited ++= ISigExpr(parse).head._2.filter(visit => !in_parse.contains(visit))
             // println(s"op_expr ${op_expr}")
             // replaceAll(op_expr, parse, repl)
             // println(s"ISigExpr ${repl} ${parse} ${visited.size} ${in_parse.size}")
           }
-          else if (RExpr(parse).size != 0) {
+          else if (RExpr(parse).nonEmpty) {
             var key = ""
             RExpr(parse).foreach {
               case (expr, sigs) =>
-              if (!sigs.isEmpty) {
-                key = expr
+              if (sigs.nonEmpty) {
+                key = expr.serialize
                 for (sig <- sigs) {
                   if (!visited.contains(sig) && (sig.startsWith("_GEN") || sig.endsWith("_T") || sig.startsWith("_T"))){
                     in_parse += sig
@@ -512,15 +776,30 @@ class graphLedger(val module: DefModule) {
         val srcs = ListBuffer[String]()
         getSrc(expr, srcs)
         if (ER.contains(ins + "." + port)) 
-        ER(ins + "." + port) += (expr.serialize -> srcs.toSet)
+        ER(ins + "." + port) += (expr -> srcs.toSet)
         else {
-          ER(ins + "." + port) = mutable.Map[String, Set[String]]()
-          ER(ins + "." + port) += (expr.serialize -> srcs.toSet)
+          ER(ins + "." + port) = mutable.Map[Expression, Set[String]]()
+          ER(ins + "." + port) += (expr -> srcs.toSet)
         }
+        for (src: String <- srcs.toSet) {
+          EG(src) = EG.getOrElse(src, Set[(String, Expression)]()) ++ Set((ins + "." + port, expr))
+        }
+    }
+    instances.map(_.name).foreach { case (insname) =>
+      if (EG.contains(insname)) {
+        EG(insname).foreach { case (sink, expr) =>
+          val srcs = ListBuffer[String]()
+          getSrc(expr, srcs)
+          val psrc = srcs.filter(_.contains(insname))
+          psrc.foreach { case (p) =>
+            EG(p) = EG.getOrElse(p, Set.empty) ++ Set((sink, expr))
+          }
+        }
+      }
     }
   }
 
-  def getPortExpr(RExpr: mutable.Map[String, mutable.Map[String, Set[String]]]): mutable.Map[String, Set[(String, String)]] = {
+  def getPortExpr(RExpr: mutable.Map[String, mutable.Map[Expression, Set[String]]]): mutable.Map[String, Set[(String, String)]] = {
     val inValid = inPorts.filter(_.name.contains("valid")).map(p => p.name)
     val outValid = outPorts.filter(_.name.contains("valid")).map(p => p.name)
     var dep = mutable.Map[String, Set[(String, String)]]()
@@ -532,11 +811,11 @@ class graphLedger(val module: DefModule) {
       val op_expr = new StringBuilder()
       RExpr(valid).foreach {
         case (expr, signals) => 
-          op_expr.append(expr)
+          op_expr.append(expr.serialize)
           in_parse ++= signals.toList
       }
       println(s"${mName} initial op_expr is: ${op_expr}")
-      while (!in_parse.isEmpty) {  
+      while (in_parse.nonEmpty) {
         val parse = in_parse.head
         // if (mName.contains("LSU"))
         // println(s"parse is: ${parse}, visit is: ${visited}")
@@ -553,8 +832,8 @@ class graphLedger(val module: DefModule) {
               var key = ""
               RExpr(parse).foreach {
                 case (expr, sigs) =>
-                if (!sigs.isEmpty) {
-                  key = expr
+                if (sigs.nonEmpty) {
+                  key = expr.serialize
                   for (sig <- sigs) {
                     if (!visited.contains(sig)){
                       in_parse += sig
@@ -580,15 +859,15 @@ class graphLedger(val module: DefModule) {
             dep = dep + (valid -> (dep.getOrElse(valid, Set()) + newTuple))
           }
           else {
-            if (RExpr(parse).size != 0) {
+            if (RExpr(parse).nonEmpty) {
               // if (mName.contains("LSU"))
               // println(s"ER sig ${parse} size is: ${ER(parse).size}")
               
               var key = ""
               RExpr(parse).foreach {
                 case (expr, sigs) =>
-                if (!sigs.isEmpty) {
-                  key = expr
+                if (sigs.nonEmpty) {
+                  key = expr.serialize
                   for (sig <- sigs) {
                     if (!visited.contains(sig)){
                       in_parse += sig
@@ -598,7 +877,7 @@ class graphLedger(val module: DefModule) {
               }
               var index = op_expr.indexOf(parse)
               var nextChar = ' '
-              if (index + parse.length != op_expr.length) 
+              if (index + parse.length != op_expr.length && index != -1) 
               nextChar = op_expr.charAt(index + parse.length)
               while ((nextChar.isDigit || nextChar == '_') && index != -1) {
                 index = op_expr.indexOf(parse, index + parse.length)
@@ -639,6 +918,11 @@ class graphLedger(val module: DefModule) {
   //   val notVisited = mutable.Set[String]() + src
 
   // }
+
+  def getInstPort: Unit = {
+    IoutPorts = rN2IP.values.flatMap(_.map { case (str1, str2) => s"$str1.$str2" }).toSet
+    IinPorts = rIP2E.keySet.map{x => s"${x._1}.${x._2}" }.toSet
+  }
 
   // rN2IP, rN2MP update
   private def updateN2XP(sink: String, srcE: Expression, node: Node): Unit = {
@@ -1041,6 +1325,7 @@ class graphLedger(val module: DefModule) {
     println("")
 
     println(s"---------${mName} ER---------")
+    println(s"number: ${ER.size}")
     // ER.foreach(tup => println(s"[${tup._1}] -- {${tup._2.foreach(src=>" (" + src.mkString(", ") + ") ")}}"))
     ER.foreach(tup => {
       // Extract the key and value from the tuple
@@ -1051,20 +1336,39 @@ class graphLedger(val module: DefModule) {
       println(s"[${key}] -- ${tup._2.size} {")
       
       // Iterate over the inner set of strings and print each set surrounded by parentheses
-      value.foreach{case(expr, src) => println(s"${expr} => ${src.mkString(", ")}")}
+      value.foreach{case(expr, src) => println(s"${expr.serialize} => ${src.mkString(", ")}")}
       
       // Close the curly brace for the value and the square bracket for the key
       println("}")
     })
     println("")
 
-    println(s"---------${mName} input---------")
-    println(s"size: ${inPorts.size} [${inPorts.map(tup => tup.name).mkString(", ")}]}")
+    println(s"---------${mName} LOOPER---------")
+    // ER.foreach(tup => println(s"[${tup._1}] -- {${tup._2.foreach(src=>" (" + src.mkString(", ") + ") ")}}"))
+    println(s"number: ${LoopER.size}")
+    LoopER.foreach(tup => {
+      // Extract the key and value from the tuple
+      val key = tup._1
+      val value = tup._2
+
+      // Use string interpolation to print the key and value
+      println(s"[${key}] -- ${tup._2.size} {")
+      
+      // Iterate over the inner set of strings and print each set surrounded by parentheses
+      value.foreach{case(expr, src) => println(s"${expr.serialize} => ${src.mkString(", ")}")}
+      
+      // Close the curly brace for the value and the square bracket for the key
+      println("}")
+    })
     println("")
 
-    println(s"---------${mName} output---------")
-    println(s"size: ${outPorts.size} [${outPorts.map(tup => tup.name).mkString(", ")}]}")
-    println("")
+//    println(s"---------${mName} input---------")
+//    println(s"size: ${inPorts.size} [${inPorts.map(tup => tup.name).mkString(", ")}]}")
+//    println("")
+//
+//    println(s"---------${mName} output---------")
+//    println(s"size: ${outPorts.size} [${outPorts.map(tup => tup.name).mkString(", ")}]}")
+//    println("")
 
     println(s"---------${mName} DEP---------")
     dep_map.foreach(tup => println(s"[${tup._1}] ${tup._2.size} -- {${tup._2.map(x => s"(${x._1}: ${x._2})").mkString("\n")}}"))
@@ -1084,7 +1388,7 @@ class graphLedger(val module: DefModule) {
     println("")
 
     println(s"---------${mName} EG---------")
-    EG.foreach(tup => println(s"[${tup._1}] -- {${tup._2.mkString(", ")}}"))
+    EG.foreach(tup => println(s"[${tup._1}] -- {${tup._2.map(x => s"(${x._1}, ${x._2.serialize})")}}"))
     println("")
 
     println(s"---------${mName} expEG---------")
