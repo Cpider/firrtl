@@ -357,6 +357,13 @@ class SpdocInstr extends Transform {
     }))
     logger.close()
 
+    // Print the signal width
+    logger = new PrintWriter(new File(s"${logPath}/${circuit.main}.width.json"))
+    logger.write(writePretty(gLedgers.map { case (m, g) =>
+      (m, g.NodeType.map { case (sig, w) => (sig, w) })
+    }))
+    logger.close()
+
     // Print the connect port relationship
     logger = new PrintWriter(new File(s"${logPath}/${circuit.main}.connect.json"))
     logger.write(writePretty(connect_port.map {case (in, out) => (in._1 + "," + in._2, out)}))

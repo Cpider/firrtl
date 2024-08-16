@@ -170,7 +170,7 @@ class graphLedger(val module: DefModule) {
   var LoopER = Map[String, mutable.Map[Expression, Set[String]]]()
   val expER = mutable.Map[String, mutable.Map[Expression, Set[String]]]()
   val EG = mutable.Map[String, Set[(String, Expression)]]()
-  val NT = mutable.Map[String, String]()
+  val NodeType = mutable.Map[String, String]()
   val ISigER = mutable.Map[String, mutable.Map[String, Set[String]]]()
   val SigV = mutable.Map[String, Int]()
   val SigInV = mutable.Map[String, mutable.Map[String, Int]]()
@@ -225,6 +225,8 @@ class graphLedger(val module: DefModule) {
   private def buildG: Unit = {
     this.module foreachPort findNode
     this.module foreachStmt findNode
+    this.module.foreachPort(getWidth(this.NodeType))
+    this.module.foreachStmt(getWidth(this.NodeType))
 
     for ((n, _) <- G) {
       val sinks = ListBuffer[String]()
@@ -286,6 +288,41 @@ class graphLedger(val module: DefModule) {
       case other => Unit
     }
   }
+
+  private def getWidth(nodetype: mutable.Map[String, String])(s: FirrtlNode): Unit = s match {
+      case reg: DefRegister =>
+        nodetype(reg.name) = reg.tpe.serialize
+
+      case nod: DefNode =>
+        nod.value match {
+          case WRef(refName, tpe, _, _) => nodetype(nod.name) = tpe.serialize
+          case WSubField(e, _, _, _) => println(s"WSubfield not consider")
+          case Reference(refName, tpe, _, _) => nodetype(nod.name) = tpe.serialize
+          case SubField(e, _, _, _) => println(s"SubField not consider")
+          case SubIndex(e, _, _, _) => println(s"SubIndex not consider")
+          case SubAccess(e, _, _, _) => println(s"SubAccess not consider")
+          case Mux(cond, tval, fval, tpe) =>
+            nodetype(nod.name) = tpe.serialize
+          case DoPrim(_, args, _, tpe) =>
+            nodetype(nod.name) = tpe.serialize
+        }
+
+      case port: Port =>
+        nodetype(port.name) = port.tpe.serialize
+
+      case ins: DefInstance =>
+        ins.tpe match {
+          case BundleType(fields) => fields.foreach {
+            field =>
+              nodetype(s"${ins.name}.${field.name}") = field.tpe.serialize
+          }
+        }
+
+      case block: Block =>
+        block.foreachStmt(getWidth(nodetype))
+
+      case _ => Unit //  Port, DefWire, DefMemory, WDefInstance
+    }
 
   private def findEdgeExp(n: Node, sinks: ListBuffer[String], sinksExpr: ListBuffer[(String, Expression)], srcs: mutable.Map[Expression, Set[String]])(s: Statement): Unit = {
     s match {
@@ -1319,6 +1356,10 @@ class graphLedger(val module: DefModule) {
   /******************** Print functions ******************************************/
   def printLog: Unit = {
     println(s"====================$mName=========================")
+
+    println(s"---------${mName} NT---------")
+    NodeType.foreach(tup => println(s"${tup._1} -- ${tup._2}"))
+    println("")
 
     println(s"---------${mName} R---------")
     R.foreach(tup => println(s"[${tup._1}] -- {${tup._2.mkString(", ")}}"))
