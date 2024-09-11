@@ -67,8 +67,11 @@ solver.add(io_core_exe_0_req_valid == BitVecVal(1, 1))
 
 z3tail = '''
 
-print(solver.check())
-print(solver.model())
+check = solver.check()
+model = solver.model()
+print(check)
+for decl in model.decls():
+    print("{} = {}".format(decl.name(), model[decl]))
 
 '''
 
