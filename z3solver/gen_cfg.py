@@ -104,15 +104,12 @@ class HDL_CFG:
     def get_word(self, expr):
         split = expr.strip().split(' ')
         words = list()
-        # if len(split) == 1:
-        #     words += split
-        # else:
         for word in split:
             real_word = re.search("^[~|]?([a-zA-Z0-9_]*)$", word)
             if real_word:
                 words.append(real_word.group(1))
-        if len(words) != 0:
-            print(words)    
+        # if len(words) != 0:
+        #     print(words)    
         return words
 
     def unroll_expr(self, expr):
@@ -183,7 +180,6 @@ class HDL_CFG:
             parsed_node.append(wire)
         cfg_map[expr_node] = '\n'.join(wire_assign_text)
         node_num += 1
-        # print(parsed_node)
         not_parsed = list(set(self.wires.keys()) - set(parsed_node))
         if len(not_parsed) != 0:
             print(not_parsed, len(not_parsed))
@@ -219,36 +215,38 @@ class HDL_CFG:
                     print(f"{sig} may a register var")
 
 
+def test():
+    lsu_cfg = HDL_CFG(args.file)
+    lsu_cfg.parse_verilog()
+    cfg_map = dict()
+    cfg = lsu_cfg.regen_cfg(cfg_map)
+    print(f"graph node num: {len(cfg.nodes)}, edge is: {len(cfg.edges)}")
 
-lsu_cfg = HDL_CFG(args.file)
-lsu_cfg.parse_verilog()
-cfg_map = dict()
-cfg = lsu_cfg.regen_cfg(cfg_map)
-print(f"graph node num: {len(cfg.nodes)}, edge is: {len(cfg.edges)}")
+    print(len(lsu_cfg.wires.keys()), len(lsu_cfg.temp_wires))
+    print(set(lsu_cfg.temp_wires) - set(lsu_cfg.wires.keys()))
+    test = dict(filter(lambda x: x[1].get('expr'), lsu_cfg.wires.items()))
+    # print("Expr is:")
+    # print(test)
+    # print("-----")
+    # for cond, srcs in conds.items():
+    #     print(wires[cond])
+    # print(cfg.edges())
 
-print(len(lsu_cfg.wires.keys()), len(lsu_cfg.temp_wires))
-print(set(lsu_cfg.temp_wires) - set(lsu_cfg.wires.keys()))
-test = dict(filter(lambda x: x[1].get('expr'), lsu_cfg.wires.items()))
-# print("Expr is:")
-# print(test)
-# print("-----")
-# for cond, srcs in conds.items():
-#     print(wires[cond])
-# print(cfg.edges())
+    ## Dump the cfg.
+    lsu_cfg.draw_cfg('lsu_cfg', cfg, cfg_map)
+    print("Expr wires")
+    for sig, info in lsu_cfg.wires.items():
+        if info.get('expr'):
+            if info.get('width'):
+                print(f"{info['width']} {sig} : {info['expr']}")
+            elif lsu_cfg.ports.get(sig):   
+                print(f"{lsu_cfg.ports[sig]['width']} {sig} {info['expr']}")  
+            else:
+                print(f"{sig} may a register var")
+            
 
-## Dump the cfg.
-lsu_cfg.draw_cfg('lsu_cfg', cfg, cfg_map)
-print("Expr wires")
-for sig, info in lsu_cfg.wires.items():
-    if info.get('expr'):
-        if info.get('width'):
-            print(f"{info['width']} {sig} : {info['expr']}")
-        elif lsu_cfg.ports.get(sig):   
-            print(f"{lsu_cfg.ports[sig]['width']} {sig} {info['expr']}")  
-        else:
-            print(f"{sig} may a register var")
-        
+    # pos = nx.nx_agraph.graphviz_layout(cfg, prog='dot')
+    # nx.draw(cfg, pos, with_labels=True, arrows=True)
+    # plt.show()
 
-# pos = nx.nx_agraph.graphviz_layout(cfg, prog='dot')
-# nx.draw(cfg, pos, with_labels=True, arrows=True)
-# plt.show()
+# test()
