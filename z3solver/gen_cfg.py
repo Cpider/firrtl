@@ -6,21 +6,12 @@ import graphviz
 import networkx as nx
 import matplotlib.pyplot as plt
 
-parser = argparse.ArgumentParser(
-                    prog='gen_cfg.py',
-                    description='Regenerate the CFG for verilog',
-                    epilog='Writed by Yinshuai')
-
-parser.add_argument('-f', "--file", metavar='N', type=str, default='',
-                    help='The verilog file to generate cfg')
 
 temp_get_wire = re.compile(r"(wire)\s*(\[\d+:\d+\])?\s*([^,;\s]+)")
 get_port = re.compile(r"(input|output)\s*(\[\d+:\d+\])?\s*([^,\s]+)")
 get_vars = re.compile(r"(reg|wire)\s*(\[\d+:\d+\])?\s*([^,\s]+);")
 get_cond_assign = re.compile(r"(assign|wire)\s*(\[\d+:\d+\])?\s*([^\s]+) = (.+) \? (.+) : (.+);") 
 get_assign = re.compile(r"(assign|wire)\s*(\[\d+:\d+\])?\s*([^,\s]+) = ([^?]+);") 
-
-args = parser.parse_args()
 
 class HDL_CFG:
 
@@ -119,9 +110,9 @@ class HDL_CFG:
                 # print('expr ' + wires[word].get('expr'))   
                 # print('unroll ' + word)
                 repl_expr = self.wires[word].get('expr')
-                print(f'original expr: {repl_expr}')
+                # print(f'original expr: {repl_expr}')
                 unroll = self.unroll_expr(repl_expr)
-                print(f'unroll expr : {unroll}')
+                # print(f'unroll expr : {unroll}')
                 new_expr = list()
                 for i in expr.split(' '):
                     if i == word:
@@ -203,19 +194,36 @@ class HDL_CFG:
         pass
 
     def df_convert_cf(self):
+        need_expand = list()
         for sig, info in self.wires.items():
             if info.get('expr'):
                 if info.get('width'):
-                    if info.get('width') == '1':
+                    if info.get('width') == 1:
                         self.cf_encode(sig, info['expr'])
+                        # print(sig)
+                        need_expand.append(sig)
                 elif self.ports.get(sig):   
-                    if self.ports[sig]['width'] == '1':
+                    if self.ports[sig]['width'] == 1:
                         self.cf_encode(sig, info['expr'])
+                        need_expand.append(sig)
+                        # print(sig)
                 else:
                     print(f"{sig} may a register var")
+        return need_expand
 
 
 def test():
+    parser = argparse.ArgumentParser(
+                    prog='gen_cfg.py',
+                    description='Regenerate the CFG for verilog',
+                    epilog='Writed by Yinshuai')
+
+    parser.add_argument('-f', "--file", metavar='N', type=str, default='',
+                        help='The verilog file to generate cfg')
+    
+    args = parser.parse_args()
+    
+    
     lsu_cfg = HDL_CFG(args.file)
     lsu_cfg.parse_verilog()
     cfg_map = dict()
