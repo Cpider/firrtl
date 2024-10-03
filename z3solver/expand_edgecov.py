@@ -23,6 +23,10 @@ args = parser.parse_args()
 cpp_assign = re.compile(r"([^\s]+) = (.*);")
 stmt_terminal = ['{', '}', '//', '#include']
 
+op_match = re.compile(r"^[^\w,\(\)]+$")
+opkeyword = set()
+oplist = {}
+
 class SIMRefactor:
     def __init__(self, vdir = '', sdir = ''):
         self.vdir = vdir
@@ -44,7 +48,9 @@ class SIMRefactor:
                     self.mod_class[module] = module_cfg
                 else:
                     print(f"[Error] {module} verilog file is not exisit!")
-        # print(self.expand_sig)
+        print(self.expand_sig)
+        print(len(self.expand_sig), len(set(self.expand_sig)))
+        input()
         if len(self.expand_sig) != 0:
             for file in os.listdir(self.sdir):
                 if fnmatch.fnmatch(file, f'VTestHarness_{module}__DepSet*.cpp'):
@@ -60,7 +66,34 @@ class SIMRefactor:
             print(file)
             rewrite_file = os.path.join(os.path.dirname(file), 'rewrite_' + os.path.basename(file))
             self.refactor_cpp(file, rewrite_file, self.expand_sig)
+            print(f"opkeyword: {opkeyword}")
+            # Check oplist
+            for num, opl in oplist.items():
+                print(f"op num is: {num}")
+                for op in opl:
+                    print(f"{op}")
 
+    def ops_collect(self, ops):
+        if len(ops) == 0:
+            return
+        global oplist
+        temp_ops = oplist.get(len(ops))
+        if temp_ops:
+            eq = 0
+            for i in temp_ops:
+                for j in range(len(ops)):
+                    if i[j] == ops[j]:
+                        eq = 1
+                    else:
+                        eq = 0
+                        break
+                if eq == 1:
+                    break
+            if eq == 0:
+                oplist[len(ops)].append(ops)
+
+        else:
+            oplist[len(ops)] = [ops]
 
     def refactor_cpp(self, orig_file, rewrite_file, expand_sig):
         with open(orig_file, 'r')  as of:
@@ -75,7 +108,7 @@ class SIMRefactor:
                     ref.write(single_line)
                     continue
                 if ';' not in single_line:
-                    statement += single_line.strip()
+                    statement += ' ' + single_line.strip()
                     continue
                 
                 if statement == '':
@@ -85,108 +118,151 @@ class SIMRefactor:
                     statement += ' ' + single_line.strip()
                 # print(f"stmt is: {statement}")
                 assign_stmt = cpp_assign.search(statement)
-                print(f"statement is: {statement}")
                 if assign_stmt:
                     # print(f"stmt is: {statement}")
                     sink = assign_stmt.group(1)
                     src_expr = assign_stmt.group(2)
-                    print(f"sink is: {sink}, srcs expr is: {src_expr}")
                     if sink.split('__')[-1] in expand_sig:
+                        print(f"stmt is: {statement}")
+                        print(f"sink is: {sink}, srcs expr is: {src_expr}")
                         ops, opds = self.parse_expression(src_expr)
+                        print(f"ops is: {ops}")
+                        self.ops_collect(ops)
                         converted_text = '\n'.join(self.convert(ops, opds, sink))
                         print(converted_text)
                         ref.write(converted_text + '\n')
                         statement = ''
                     else:
-                        ref.write(statement + '\n')
+                        ref.write(' ' * 4 + statement.strip() + '\n')
                         statement = ''
 
-                    # input()
-
                 else:
-                    ref.write(statement)
+                    ref.write(' ' * 4 + statement + '\n')
                     statement = ''
-                
+
     def parse_expression(self, expression):
+        parse_operators = []
+        parse_operands = []
         operators = []
         operands = []
 
         i = 0
         word_list = list()
         word = ''
-        unclose = 0
-        lhs = ''
-        rhs = ''
+        unclose = [0]
+        bracket_index = []
+        op_index = []
+        global opkeyword
+        prev_word = ''
 
         while i < len(expression):
             if expression[i] == '(':
-                unclose += 1
+                # print(f"( word: {word}")
+                prev_word = ''
+                if len(word_list) != 0:
+                    prev_word = word_list.pop()
+
+                if op_match.match(prev_word):
+                    # print(f"op match word: {prev_word}, word_list: {word_list}, parse_operand: {parse_operands}")
+                    opkeyword.add(prev_word)
+
+                    # if len(parse_operands) == 0:
+                    temp = ''
+                    while '(' != word_list[-1][-1]:
+                        temp = word_list.pop() + temp
+
+                    parse_operands.append({'lhs': temp})
+                    # print(f"op {word}, temp: {temp}, oprands: {parse_operands}")
+                    # bracket_index.append(len(word_list))
+
+                    word_list.append(temp)
+                    op_index.append(len(word_list) + 1)
+
+                    parse_operators.append(prev_word)
+
+                if prev_word != '':
+                    word_list.append(prev_word)
                 word_list.append(word + '(')
-                word = ''
-                print(f"word: {word}")
+                bracket_index.append(len(word_list))
 
-            elif expression[i] in ['&', '|']:
-                print(word_list)
-                if lhs != '':
-                    operators.append(expression[i])
-                    operands.append({'lhs': lhs})
-                else:
-                    operators.append(expression[i])
-                    while '(' in word_list[-1] and ')' in word_list[-1]:
-                            lhs = word_list.pop() + lhs
-                    if lhs == '':
-                        lhs = word
-                    operands.append({'lhs': lhs})
-                    print(f"lhs: {lhs}")    
-                print(f"word: {word}")
+                # print(f"(fini word_list: {word_list}, word: {word}, bracket_index: {bracket_index}, parse_operand: {parse_operands}")
                 word = ''
+
             elif expression[i] == ')':
-                if i + 1 < len(expression) and expression[i+1] == ')':
-                    if len(operands) == 0:     
-                        print(f"word: {word}")      
-                        word_list[-1] = word_list[-1] + word + ')'
-                        print(f'word_list: {word_list}')
-                        while '(' in word_list[-1] and ')' in word_list[-1]:
-                                rhs = word_list.pop() + rhs
-                        print(f'rhs {rhs}')
-                        operands.append({'lhs': rhs})
-                        word_list.pop()
+                unclose[-1] -= 1
+                if word != '':
+                    word_list.append(word)  
+                # print(f") begin: word: {word}, word_list: {word_list}, bracket_index: {bracket_index}")
+
+                if len(op_index) != 0 and len(bracket_index) != 0:
+                    if bracket_index[-1] > op_index[-1]:
+                        temp = ')'
+                        while '(' != word_list[-1][-1]:
+                            temp = word_list.pop() + temp
+                        temp = word_list.pop() + temp
+                        bracket_index.pop()
+                        word_list.append(temp)
+                        # print(f"): temp {temp}, bracket_index: {bracket_index}, op_index: {op_index}, word_list: {word_list}, word: {word}")
                     else:
-                        if operands[-1].get('lhs') and not operands[-1].get('rhs'):
-                            word_list[-1] = word_list[-1] + word + ')'
-                            while '(' in word_list[-1] and ')' in word_list[-1]:
-                                rhs = word_list.pop() + rhs
-                            word_list.pop()
-                            operands[-1]['rhs'] = rhs
-                            lhs = operands[-1]['lhs'] + ' ' + operators[-1] + ' ' + operands[-1]['rhs']
-                            rhs = ''
-                        
-                    print(word_list)
-                    # word_list[-1] = word_list[-1] + word + ')'
-                    # while '(' in word_list[-1] and ')' in word_list[-1]:
-                    #     rhs = word_list.pop() + rhs
-                    #     print(rhs + '   ' + word)
-                    unclose -= 1       
-                    i += 1
+                        temp = ''
+                        n = len(word_list)
+                        for j in range(op_index[-1], n):
+                            temp = word_list.pop() + temp
+                        parse_operands[-1]['rhs'] = temp
+                        word_list.append(temp)
+                        operands.append(parse_operands.pop())
+                        operators.append(parse_operators.pop())  
+                        # print(f"[finish] pop op: {operands[-1]}, {operators[-1]}")
+                        temp = ''
 
-                else:
-                    word_list[-1] = word_list[-1] + word + ')'
-                    print(f"word: {word}")
-                unclose -= 1
+                        n = len(word_list)
+                        temp += ')'
+                        for j in range(n, bracket_index[-1] - 1, -1):
+                            if j == op_index[-1]:
+                                temp = ' ' + word_list.pop() + ' ' + temp
+                            else:
+                                temp = word_list.pop() + temp
+                            # print(f"word_list pop: {temp}")
+                        if len(parse_operands) != 0:
+                            parse_operands[-1]['rhs'] = temp
+
+                        word_list.append(temp)
+                        bracket_index.pop()
+                        op_index.pop()
+                        # print(f"): temp {temp}, bracket_index: {bracket_index}, op_index: {op_index}, word_list: {word_list}, word: {word}")
+                elif len(op_index) == 0 and len(bracket_index) != 0:
+                    temp = ')'
+                    while '(' != word_list[-1][-1]:
+                        temp = word_list.pop() + temp
+                    temp = word_list.pop() + temp
+                    bracket_index.pop()
+                    word_list.append(temp)
+                    # print(f"): temp {temp}, bracket_index: {bracket_index}, op_index: {op_index}, word_list: {word_list}, word: {word}")
+
                 word = ''
-
+                if len(bracket_index) == 0:
+                    break
+                
             elif expression[i] == ' ':
-                pass
+                if word != '':
+                    word_list.append(word)
+                    word = ''   
             else:
                 word += expression[i]
             i += 1
 
-        if len(operators) == 0 and len(operands) == 0:
-            operands.append({'lhs': word})
-
-        print(operators)
-        print(operands)
-        print(word)
+        if len(operands) == 0 and len(operators) == 0:
+            # print(f"op0: {word_list} word: {word}")
+            if len(word_list) != 0:
+                operands.append({'lhs' : word_list.pop()})
+            else:
+                operands.append({'lhs' : word})
+        elif len(operands) == 0 and len(operators) != 0 or len(operands) != 0 and len(operators) == 0:
+            print(f"[ERROR] the operands {operands} and operators {operators} doesn't match!")
+        
+        # print(operators)
+        # print(operands)
+        # print(word_list)
         return operators, operands
 
 
@@ -195,7 +271,7 @@ class SIMRefactor:
         leaf_node = [0]
         converted = ['1']
 
-        def insert_node(leaf_node, converted, node, op = ''):
+        def insert_node(leaf_node, converted, node, op = '', level = 1):
             new_leaf = []
             index = 0
             insert_line = 0
@@ -205,59 +281,52 @@ class SIMRefactor:
                 insert_line -= 1
                 # print(f"index is: {index}, converted is: {converted}")
                 # print(f"new_leaf is: {new_leaf}")
-                converted.insert(index, f"if ({node}) {{")
+                converted.insert(index, " " * 4 * level + f"if ({node}) {{")
                 index += 1
                 insert_line += 1
-                if op == '':
-                    if sink != '':
-                        converted.insert(index, f"{sink} = {assign_value};")
-                    else:
-                        converted.insert(index, assign_value)
-                elif op == '&':
-                    if sink != '':
-                        converted.insert(index, f"{sink} = {assign_value};")
-                    else:
-                        converted.insert(index, assign_value)
+                # print(f"assign_value is: {assign_value}")
+                if op == '&':
+                    # print(f"& {assign_value}")
+                    converted.insert(index, assign_value)
                 elif op == '|':
-                    if sink != '':
-                        converted.insert(index, f"{sink} = 1;")
-                    else:
-                        converted.insert(index, '1')
+                    # print(f"| {assign_value}")
+                    converted.insert(index, '1')
+                elif op == '^':
+                    # print(f"^ {assign_value}")
+                    converted.insert(index, str(1 ^ int(assign_value)))
                 else:
-                    print(f"[OPWARNING] {op} is not legal")
+                    # print(f"Nop {op} {assign_value}")
+                    converted.insert(index, assign_value)
+                    # print(f"[OPWARNING] {op} is not legal")
                 new_leaf.append(index)
 
                 index += 1
                 insert_line += 1
-                converted.insert(index, "}")
+                converted.insert(index, " " * 4 * level + "}")
                 index += 1
                 insert_line += 1
-                converted.insert(index, "else {")
+                converted.insert(index, " " * 4 * level + "else {")
                 index += 1
                 insert_line += 1
-                if op == '':
-                    if sink != '':
-                        converted.insert(index, f"{sink} = {str(1 - int(assign_value))};")
-                    else:
-                        converted.insert(index, str(1 - int(assign_value)))
-                elif op == '&':
-                    if sink != '':
-                        converted.insert(index, f"{sink} = 0;")
-                    else:
-                        converted.insert(index, '0')
+                if op == '&':
+                    # print(f"& {assign_value}")
+                    converted.insert(index, '0')
                 elif op == '|':
-                    if sink != '':
-                        converted.insert(index, f"{sink} = {assign_value};")
-                    else:
-                        converted.insert(index, assign_value)
+                    # print(f"| {assign_value}")
+                    converted.insert(index, assign_value)
+                elif op == '^':
+                    # print(f"^ {assign_value}")
+                    converted.insert(index, str(0 ^ int(assign_value)))
                 else:
-                    print(f"[OPWARNING] {op} is not legal")
+                    # print(f"nop {assign_value}")
+                    converted.insert(index, str(1 - int(assign_value)))
+                    # print(f"[OPWARNING] {op} is not legal")
                 new_leaf.append(index)
                 
 
                 index += 1
                 insert_line += 1
-                converted.insert(index, "}")
+                converted.insert(index, " " * 4 * level + "}")
                 index += 1
                 insert_line += 1
                 # print(f"index is: {index}, converted is: {converted}")
@@ -268,23 +337,57 @@ class SIMRefactor:
             # print(converted)
             # print(f"leaf_node is: {leaf_node}")
 
+        level = 1
+
+        # Check if ops have the &, |, ^ operators, and check if its operands are 1 width signals.
         if len(ops) == 0:
-            opd = oprands[0]
-            insert_node(leaf_node, converted, opd['lhs'])
-            print('\n'.join(converted))
-            return converted
+            print(f"No ops")
+            insert_node(leaf_node, converted, oprands[0]['lhs'], level = level)
+            print(f"add node: {oprands[0]['lhs']}")
+            level += 1
 
-        while i < len(ops):
-            op = ops[i]
-            opd = oprands[i]
-            if i == 0:
-                insert_node(leaf_node, converted, opd['lhs'])
+        elif '&' not in ops and '|' not in ops and '^' not in ops:
+            node = oprands[-1]['lhs'] + ' ' + ops[-1] + ' ' + oprands[-1]['rhs']
+            insert_node(leaf_node, converted, node, ops[-1], level = level)
+            level += 1
 
-            # print(f"leaf_node is: {leaf_node}")
-            insert_node(leaf_node, converted, opd['rhs'], op)
-            i += 1
+        else:
+            # TODO
+            add_node_op = []
+            op_w2o = ['>=', '<', '>', '==', '!=', '<=']
+            logic_op = ['^', '&', '|']
+            for op_index in range(len(ops)):
+                if ops[op_index] in op_w2o:
+                    if len(add_node_op) != 0:
+                        temp = oprands[add_node_op[-1]]['lhs'] + ' ' + ops[add_node_op[-1]] + ' ' + oprands[add_node_op[-1]]['rhs']
+                        if temp in oprands[op_index]['lhs'] or temp in oprands[op_index]['rhs']:
+                            add_node_op.clear()
+                elif ops[op_index] in logic_op:
+                    add_node_op.append(op_index)
+            if len(add_node_op) == 0:
+                node = oprands[-1]['lhs'] + ' ' + ops[-1] + ' ' + oprands[-1]['rhs']
+                insert_node(leaf_node, converted, node, ops[-1], level = level)
+                level += 1
+            else:
+                print(f"op is: {ops}, add_node_ops is: {add_node_op}")
+                insert_node(leaf_node, converted, oprands[add_node_op[0]]['lhs'], level = level)
+                print(f"add node: {oprands[add_node_op[0]]['lhs']}")
+                level += 1
+                node = oprands[add_node_op[0]]['lhs']
+                for op_index in add_node_op:
+                    if node in oprands[op_index]['lhs']:
+                        insert_node(leaf_node, converted, oprands[op_index]['rhs'], ops[op_index], level)
+                        print(f"add node: {oprands[op_index]['rhs']}, op is: {ops[op_index]}")
+                    else:
+                        insert_node(leaf_node, converted, oprands[op_index]['lhs'], ops[op_index], level)
+                        print(f"add node: {oprands[op_index]['lhs']}, op is: {ops[op_index]}")
+                    level += 1
+                    node = oprands[op_index]['lhs'] + ' ' + ops[op_index] + ' ' + oprands[op_index]['rhs']
         
-        print('\n'.join(converted))
+        if sink != '':
+            for i in leaf_node:
+                converted[i] = " " * 4 * (level - 1) + f"    {sink} = {converted[i]};"
+        # print('\n'.join(converted))
         return converted
 
 
