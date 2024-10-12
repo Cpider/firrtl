@@ -20,12 +20,15 @@ parser.add_argument('-m', "--module", metavar='N', type=str, default='',
 
 args = parser.parse_args()
 
-cpp_assign = re.compile(r"([^\s]+) = (.*);")
+cpp_assign = re.compile(r"([^\s]+) += +(.*);")
 stmt_terminal = ['{', '}', '//', '#include']
 
+op_words = [' ^ ', ' > ', ' >= ', ' | ', ' & ', ' == ', ' ~ ', ' != ', ' < ', ' <= ', '>>', '<<', '+', '-', '*', '/']
 op_match = re.compile(r"^[^\w,\(\)]+$")
 opkeyword = set()
 oplist = {}
+op_w2o = ['>=', '<', '>', '==', '!=', '<=']
+logic_op = ['^', '&', '|']
 
 class SIMRefactor:
     def __init__(self, vdir = '', sdir = ''):
@@ -49,8 +52,7 @@ class SIMRefactor:
                 else:
                     print(f"[Error] {module} verilog file is not exisit!")
         print(self.expand_sig)
-        print(len(self.expand_sig), len(set(self.expand_sig)))
-        input()
+        print(len(self.expand_sig), len(set(self.expand_sig)))   
         if len(self.expand_sig) != 0:
             for file in os.listdir(self.sdir):
                 if fnmatch.fnmatch(file, f'VTestHarness_{module}__DepSet*.cpp'):
@@ -62,20 +64,22 @@ class SIMRefactor:
             # for file in self.refact_file:
             #     rewrite_file = 'rewrite_' + file
             #     self.refactor_cpp(file, rewrite_file, self.expand_sig)
-            file = self.refact_file[-1]
-            print(file)
-            rewrite_file = os.path.join(os.path.dirname(file), 'rewrite_' + os.path.basename(file))
-            self.refactor_cpp(file, rewrite_file, self.expand_sig)
-            print(f"opkeyword: {opkeyword}")
-            # Check oplist
-            for num, opl in oplist.items():
-                print(f"op num is: {num}")
-                for op in opl:
-                    print(f"{op}")
+            for file in self.refact_file:
+                # file = self.refact_file[-1]
+                print(file)
+                input()
+                rewrite_file = os.path.join(os.path.dirname(file), 'rewrite_' + os.path.basename(file))
+                self.refactor_cpp(file, rewrite_file, self.expand_sig)
+                print(f"opkeyword: {opkeyword}")
+                # Check oplist
+                for num, opl in oplist.items():
+                    print(f"op num is: {num}")
+                    for op in opl:
+                        print(f"{op}")
 
     def ops_collect(self, ops):
         if len(ops) == 0:
-            return
+            return 0
         global oplist
         temp_ops = oplist.get(len(ops))
         if temp_ops:
@@ -91,9 +95,16 @@ class SIMRefactor:
                     break
             if eq == 0:
                 oplist[len(ops)].append(ops)
+                return 1
 
         else:
             oplist[len(ops)] = [ops]
+            return 1
+        return 0
+    
+    def get_dump(self, sink, dump_file):
+        with open(dump_file, 'a+') as f:
+            f.write(f"    dfile << \"{sink.split('->')[1]} = \" << std::hex << std::setw(2) << static_cast<uint64_t>(syms->TOP__TestHarness__chiptop__system__tile_prci_domain__tile_reset_domain__boom_tile__lsu.{sink.split('->')[1]}) << std::endl;\n")
 
     def refactor_cpp(self, orig_file, rewrite_file, expand_sig):
         with open(orig_file, 'r')  as of:
@@ -102,13 +113,26 @@ class SIMRefactor:
             statement = ''
             for single_line in o_codes:
                 if any(char in single_line for char in stmt_terminal):
-                    ref.write(single_line)
+                    if statement == '':
+                        statement += ' ' + single_line
+                    else:
+                        statement += ' ' + single_line.strip(' ')
+                    ref.write(statement)
+                    statement = ''
                     continue
                 if single_line == '\n':
-                    ref.write(single_line)
+                    if statement == '':
+                        statement += ' ' + single_line
+                    else:
+                        statement += ' ' + single_line.strip(' ')
+                    ref.write(statement)
+                    statement = ''
                     continue
                 if ';' not in single_line:
-                    statement += ' ' + single_line.strip()
+                    if statement == '':
+                        statement = single_line.strip('\n')
+                    else:
+                        statement += ' ' + single_line.strip()
                     continue
                 
                 if statement == '':
@@ -122,14 +146,19 @@ class SIMRefactor:
                     # print(f"stmt is: {statement}")
                     sink = assign_stmt.group(1)
                     src_expr = assign_stmt.group(2)
+                    # print(f"all sink is: {sink} {sink.split('__')[-1]}")
                     if sink.split('__')[-1] in expand_sig:
-                        print(f"stmt is: {statement}")
+                        # print(f"stmt is: {statement}")
                         print(f"sink is: {sink}, srcs expr is: {src_expr}")
+                        # self.get_dump(sink, 'signal.txt')
                         ops, opds = self.parse_expression(src_expr)
                         print(f"ops is: {ops}")
-                        self.ops_collect(ops)
+                        ops_update = self.ops_collect(ops)
                         converted_text = '\n'.join(self.convert(ops, opds, sink))
                         print(converted_text)
+                        # if ops_update:
+                        #     print(f"Change control flow")
+                        #     print(converted_text)
                         ref.write(converted_text + '\n')
                         statement = ''
                     else:
@@ -172,7 +201,7 @@ class SIMRefactor:
                         temp = word_list.pop() + temp
 
                     parse_operands.append({'lhs': temp})
-                    # print(f"op {word}, temp: {temp}, oprands: {parse_operands}")
+                    # print(f"op {word}, temp: {temp}, operands: {parse_operands}")
                     # bracket_index.append(len(word_list))
 
                     word_list.append(temp)
@@ -209,6 +238,7 @@ class SIMRefactor:
                         for j in range(op_index[-1], n):
                             temp = word_list.pop() + temp
                         parse_operands[-1]['rhs'] = temp
+                        # print(f"temp: {temp}")
                         word_list.append(temp)
                         operands.append(parse_operands.pop())
                         operators.append(parse_operators.pop())  
@@ -225,6 +255,7 @@ class SIMRefactor:
                             # print(f"word_list pop: {temp}")
                         if len(parse_operands) != 0:
                             parse_operands[-1]['rhs'] = temp
+                            # print(f"temp: {temp}")
 
                         word_list.append(temp)
                         bracket_index.pop()
@@ -265,11 +296,15 @@ class SIMRefactor:
         # print(word_list)
         return operators, operands
 
-
-    def convert(self, ops, oprands, sink = ''):
+    def convert(self, ops, operands, sink = ''):
         i = 0
         leaf_node = [0]
         converted = ['1']
+
+        def rotate_value(leaf_node, converted):
+            for leaf_num in leaf_node:
+                origal = converted[leaf_num]
+                converted[leaf_num] = str(1 ^ int(origal))
 
         def insert_node(leaf_node, converted, node, op = '', level = 1):
             new_leaf = []
@@ -341,48 +376,100 @@ class SIMRefactor:
 
         # Check if ops have the &, |, ^ operators, and check if its operands are 1 width signals.
         if len(ops) == 0:
-            print(f"No ops")
-            insert_node(leaf_node, converted, oprands[0]['lhs'], level = level)
-            print(f"add node: {oprands[0]['lhs']}")
+            # print(f"No ops")
+            insert_node(leaf_node, converted, operands[0]['lhs'], level = level)
+            # print(f"add node: {operands[0]['lhs']}")
             level += 1
 
         elif '&' not in ops and '|' not in ops and '^' not in ops:
-            node = oprands[-1]['lhs'] + ' ' + ops[-1] + ' ' + oprands[-1]['rhs']
+            node = operands[-1]['lhs'] + ' ' + ops[-1] + ' ' + operands[-1]['rhs']
             insert_node(leaf_node, converted, node, ops[-1], level = level)
             level += 1
 
         else:
-            # TODO
             add_node_op = []
-            op_w2o = ['>=', '<', '>', '==', '!=', '<=']
-            logic_op = ['^', '&', '|']
+            not_node = []          
+            op_result = dict()
             for op_index in range(len(ops)):
                 if ops[op_index] in op_w2o:
                     if len(add_node_op) != 0:
-                        temp = oprands[add_node_op[-1]]['lhs'] + ' ' + ops[add_node_op[-1]] + ' ' + oprands[add_node_op[-1]]['rhs']
-                        if temp in oprands[op_index]['lhs'] or temp in oprands[op_index]['rhs']:
-                            add_node_op.clear()
+                        remove = []
+                        for node_index in add_node_op:
+                            result = op_result[node_index]
+                            if result in operands[op_index]['lhs'] or result in operands[op_index]['rhs']:
+                                remove.append(node_index)
+                        if len(remove) != 0:
+                            for r in remove:
+                                op_result.pop(r)
+                                add_node_op.remove(r)
+       
+                elif ops[op_index] == '~':
+
+                    not_node.append(op_index)
+                    op_result[op_index] = operands[op_index]['lhs'] + ' ' + ops[op_index] + ' ' + operands[op_index]['rhs']
                 elif ops[op_index] in logic_op:
                     add_node_op.append(op_index)
+                    op_result[op_index] = operands[op_index]['lhs'] + ' ' + ops[op_index] + ' ' + operands[op_index]['rhs']
+
             if len(add_node_op) == 0:
-                node = oprands[-1]['lhs'] + ' ' + ops[-1] + ' ' + oprands[-1]['rhs']
+                node = operands[-1]['lhs'] + ' ' + ops[-1] + ' ' + operands[-1]['rhs']
                 insert_node(leaf_node, converted, node, ops[-1], level = level)
                 level += 1
             else:
-                print(f"op is: {ops}, add_node_ops is: {add_node_op}")
-                insert_node(leaf_node, converted, oprands[add_node_op[0]]['lhs'], level = level)
-                print(f"add node: {oprands[add_node_op[0]]['lhs']}")
-                level += 1
-                node = oprands[add_node_op[0]]['lhs']
-                for op_index in add_node_op:
-                    if node in oprands[op_index]['lhs']:
-                        insert_node(leaf_node, converted, oprands[op_index]['rhs'], ops[op_index], level)
-                        print(f"add node: {oprands[op_index]['rhs']}, op is: {ops[op_index]}")
+                print(f"op is: {ops}, add_node_ops is: {add_node_op}, not_node is: {not_node}")
+                inserted = 0
+                for not_i in range(len(not_node)):
+                    if op_result[not_node[not_i]] in operands[add_node_op[0]]['lhs']:
+                        insert_node(leaf_node, converted, f"1U & {operands[add_node_op[0]]['lhs']}", level = level)
+                        not_node.pop(not_i)
+                        inserted = 1
+                        break
+                if inserted == 0:
+                    if operands[add_node_op[0]]['lhs'][:3] != "VL_":
+                        insert_node(leaf_node, converted, operands[add_node_op[0]]['lhs'], level = level)
                     else:
-                        insert_node(leaf_node, converted, oprands[op_index]['lhs'], ops[op_index], level)
-                        print(f"add node: {oprands[op_index]['lhs']}, op is: {ops[op_index]}")
+                        insert_node(leaf_node, converted, f"1U & {operands[add_node_op[0]]['lhs']}",  level = level)
+                # print(f"add node: {operands[add_node_op[0]]['lhs']}")
+                level += 1
+                node = operands[add_node_op[0]]['lhs']
+                for op_index in add_node_op:
+                    inserted = 0
+                    if node in operands[op_index]['lhs']:
+                        for not_i in range(len(not_node)):
+                            if op_result[not_node[not_i]] in operands[op_index]['rhs']:
+                                insert_node(leaf_node, converted, f"1U & {operands[op_index]['rhs']}", ops[op_index], level)
+                                not_node.pop(not_i)
+                                inserted = 1
+                                break
+                        if inserted == 0:
+                            if operands[op_index]['rhs'][:3] != "VL_":
+                                insert_node(leaf_node, converted, operands[op_index]['rhs'], ops[op_index], level)
+                            else:
+                                insert_node(leaf_node, converted, f"1U & {operands[op_index]['rhs']}", ops[op_index], level)
+                        # print(f"add node: {operands[op_index]['rhs']}, op is: {ops[op_index]}")
+                    else:
+                        for not_i in range(len(not_node)):
+                            if op_result[not_node[not_i]] in operands[op_index]['lhs']:
+                                insert_node(leaf_node, converted, f"1U & {operands[op_index]['lhs']}", ops[op_index], level)
+                                not_node.pop(not_i)
+                                inserted = 1
+                                break
+                        if inserted == 0:
+                            if operands[op_index]['lhs'][:3] != "VL_":
+                                insert_node(leaf_node, converted, operands[op_index]['lhs'], ops[op_index], level)
+                            else:
+                                insert_node(leaf_node, converted, f"1U & {operands[op_index]['lhs']}", ops[op_index], level)
+                        # print(f"add node: {operands[op_index]['lhs']}, op is: {ops[op_index]}")
                     level += 1
-                    node = oprands[op_index]['lhs'] + ' ' + ops[op_index] + ' ' + oprands[op_index]['rhs']
+                    node = operands[op_index]['lhs'] + ' ' + ops[op_index] + ' ' + operands[op_index]['rhs']
+                    for not_i in range(len(not_node)):
+                        if node in op_result[not_node[not_i]]:
+                            rotate_value(leaf_node, converted)
+                            not_node.pop(not_i)
+                            break
+
+            if len(not_node) != 0:
+                print(f"[ERROR] not op does not parse complete!")
         
         if sink != '':
             for i in leaf_node:
