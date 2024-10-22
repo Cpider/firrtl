@@ -22,6 +22,8 @@ class HDL_CFG:
         self.ports = dict()
         self.conds = dict()
         self.temp_wires = list()
+        self.src_num = dict()
+        self.assyn_num = 0
 
     def parse_verilog(self):
         with open(self.v_file, 'r') as f:
@@ -63,13 +65,15 @@ class HDL_CFG:
                     width = int(cond.group(2).split(':')[0][1:]) - int(cond.group(2).split(":")[1][:-1]) + 1 if cond.group(2) else 1
                     
                     # print(f"{cond.group(3)} srcs is: {srcs}")
-                    self.wires[cond.group(3)] = {'width': width, 'gen': True, 'cond': cond.group(4), 'true': cond.group(5), 'false': cond.group(6), 'srcs': srcs}
+                    self.wires[cond.group(3)] = {'width': width, 'gen': True, 'cond': cond.group(4), 'true': cond.group(5), 'false': cond.group(6), 'srcs': srcs, 'order': self.assyn_num}
 
                 else:
                     if not self.wires.get(cond.group(3)):
-                        self.wires[cond.group(3)] = {'gen': True, 'cond': cond.group(4), 'true': cond.group(5), 'false': cond.group(6), 'srcs': srcs}
+                        self.wires[cond.group(3)] = {'gen': True, 'cond': cond.group(4), 'true': cond.group(5), 'false': cond.group(6), 'srcs': srcs, 'order': self.assyn_num}
+                        
                     else:
-                        self.wires[cond.group(3)].update({'gen': True, 'cond': cond.group(4), 'true': cond.group(5), 'false': cond.group(6), 'srcs': srcs})
+                        self.wires[cond.group(3)].update({'gen': True, 'cond': cond.group(4), 'true': cond.group(5), 'false': cond.group(6), 'srcs': srcs, 'order': self.assyn_num})
+                self.assyn_num += 1
 
                 if not self.conds.get(cond.group(4)):
                     self.conds[cond.group(4)] = (1, [cond.group(3)])
@@ -83,14 +87,16 @@ class HDL_CFG:
                 srcs = self.get_word(assign.group(4))
                 if assign.group(1) == 'wire':
                     width = int(assign.group(2).split(':')[0][1:]) - int(assign.group(2).split(":")[1][:-1]) + 1 if assign.group(2) else 1
-                    self.wires[assign.group(3)] = {'width': width, 'gen': True, 'expr': assign.group(4), 'srcs': srcs}
+                    self.wires[assign.group(3)] = {'width': width, 'gen': True, 'expr': assign.group(4), 'srcs': srcs, 'order': self.assyn_num}
                     # print(assign.group(3), wires[assign.group(3)])
                 else:
                     if not self.wires.get(assign.group(3)):
-                        self.wires[assign.group(3)] = {'expr': assign.group(4), 'srcs': srcs}
+                        self.wires[assign.group(3)] = {'expr': assign.group(4), 'srcs': srcs, 'order': self.assyn_num}
                     else:
-                        self.wires[assign.group(3)].update({'expr': assign.group(4), 'srcs': srcs})
+                        self.wires[assign.group(3)].update({'expr': assign.group(4), 'srcs': srcs, 'order': self.assyn_num})
+                self.assyn_num += 1
                     # print(assign.group(3), wires[assign.group(3)])
+        self.ordered_wires = dict(sorted(self.wires.items(), key=lambda x: x[1].get('order', float('-inf'))))
 
     def get_word(self, expr):
         split = expr.strip().split(' ')
@@ -177,6 +183,72 @@ class HDL_CFG:
             print("[Warning] Wire variables don't parse finish!")
 
         return combine_cfg
+    
+    def check_cyclic(self):
+        skip_sig = list()
+        for sig in self.wires.keys():
+            parsed = list()
+            not_parsed = [sig]
+            while len(not_parsed) != 0:
+                s = not_parsed.pop()
+                if self.wires.get(s):
+                    info = self.wires[s]
+                else:
+                    continue
+                if s in parsed:
+                    print(f"[WAR] Find a cyclic in combination logic! Sig is: {s}")
+                parsed += s
+                if info.get('expr'):
+                    expr = info.get('expr')
+                    expr_word = self.get_word(expr)
+                    # print(f"expr_word is: {list(filter(lambda x: x in self.wires.keys() or x in self.ports.keys(), expr_word))}")
+                    not_parsed += list(filter(lambda x: (x in self.wires.keys() or x in self.ports.keys()) and x not in skip_sig, expr_word))
+                elif info.get('cond'):
+                    tf_word = self.get_word(info.get('true')) + self.get_word(info.get('false'))
+                    not_parsed += list(filter(lambda x: (x in self.wires.keys() or x in self.ports.keys()) and x not in skip_sig, tf_word))
+                    # print(f"tf_word is: {list(filter(lambda x: x in self.wires.keys() or x in self.ports.keys(), tf_word))}")
+            if s not in skip_sig:
+                skip_sig.append(s)
+            print(f"{s} check finish!")
+            skip_sig += list(set(parsed) - set(skip_sig))
+    
+    def get_reg_cond(self):
+        reg_sigs = {'cond': dict(), 'expr': dict()}
+        wrie_sigs = {'cond': dict(), 'expr': dict()}
+        reg_t = dict()
+        for sig, info in self.wires.items():
+            if info.get('cond'):
+                cond = info.get('cond')
+                cond_sig = self.get_word(cond)
+                t = 0
+                for w in cond_sig:
+                    if self.regs.get(w):
+                        # print(f"Find reg in expr of cond: {w}")
+                        reg_sigs['cond'][sig] = f"{cond} ? {info.get('true')} : {info.get('false')}"
+                        t = 1
+                        break
+                if t == 0:
+                    wrie_sigs['cond'][sig] = f"{cond} ? {info.get('true')} : {info.get('false')}"
+
+                for w in self.get_word(info['true']) + self.get_word(info['false']):
+                    if self.regs.get(w) and t == 0:
+                        reg_t[sig] = f"{cond} ? {info.get('true')} : {info.get('false')}"
+                
+            elif info.get('expr'):
+                expr = info.get('expr')
+                expr_sig = self.get_word(expr)
+                t = 0
+                for w in expr_sig:
+                    if self.regs.get(w):
+                        # print(f"Find reg in expr: {w}")
+                        reg_sigs['expr'][sig] = expr
+                        t = 1
+                        break
+                if t == 0:
+                    wrie_sigs['expr'][sig] = expr
+
+        return reg_sigs, wrie_sigs, reg_t
+
 
     def draw_cfg(self, name, cfg, node_map):
         dot = graphviz.Digraph()
@@ -212,7 +284,7 @@ class HDL_CFG:
         return need_expand
 
 
-def test():
+def test(dump = False):
     parser = argparse.ArgumentParser(
                     prog='gen_cfg.py',
                     description='Regenerate the CFG for verilog',
@@ -233,6 +305,32 @@ def test():
     print(len(lsu_cfg.wires.keys()), len(lsu_cfg.temp_wires))
     print(set(lsu_cfg.temp_wires) - set(lsu_cfg.wires.keys()))
     test = dict(filter(lambda x: x[1].get('expr'), lsu_cfg.wires.items()))
+    srcs_reg, srcs_wires, reg_t = lsu_cfg.get_reg_cond()
+    print(f"Register signals in expr src is: {len(srcs_reg['expr'])}")
+    for s, e in srcs_reg['expr'].items():
+        print(f"{s}: {e}")
+
+    print(f"Register signals in cond src is: {len(srcs_reg['cond'])}")
+    for s, e in srcs_reg['cond'].items():
+        print(f"{s}: {e}")
+
+    print(f"Wire signals in expr src is: {len(srcs_wires['expr'])}")
+    for s, e in srcs_wires['expr'].items():
+        print(f"{s}: {e}")
+
+    print(f"Wire signals in cond src is: {len(srcs_wires['cond'])}")
+    for s, e in srcs_wires['cond'].items():
+        print(f"{s}: {e}")
+
+    print(f"Register signals in true false src is: {len(reg_t)}")
+    for s, e in reg_t.items():
+        print(f"{s}: {e}")
+
+    lsu_cfg.check_cyclic()
+
+    print("Ordered wires")
+    for s, i in lsu_cfg.ordered_wires.items():
+        print(f"{s}: {i}")
     # print("Expr is:")
     # print(test)
     # print("-----")
@@ -241,20 +339,29 @@ def test():
     # print(cfg.edges())
 
     ## Dump the cfg.
-    lsu_cfg.draw_cfg('lsu_cfg', cfg, cfg_map)
-    print("Expr wires")
-    for sig, info in lsu_cfg.wires.items():
-        if info.get('expr'):
-            if info.get('width'):
-                print(f"{info['width']} {sig} : {info['expr']}")
-            elif lsu_cfg.ports.get(sig):   
-                print(f"{lsu_cfg.ports[sig]['width']} {sig} {info['expr']}")  
-            else:
-                print(f"{sig} may a register var")
+    if dump:
+        lsu_cfg.draw_cfg('lsu_cfg', cfg, cfg_map)
+        print("Expr wires")
+        for sig, info in lsu_cfg.wires.items():
+            if info.get('expr'):
+                if info.get('width'):
+                    print(f"{info['width']} {sig} : {info['expr']}")
+                elif lsu_cfg.ports.get(sig):   
+                    print(f"{lsu_cfg.ports[sig]['width']} {sig} {info['expr']}")  
+                else:
+                    print(f"{sig} may a register var")
             
 
     # pos = nx.nx_agraph.graphviz_layout(cfg, prog='dot')
     # nx.draw(cfg, pos, with_labels=True, arrows=True)
     # plt.show()
 
-# test()
+def get_srcunroll():
+    test_file = 'module/LSU.v'
+    lsu_cfg = HDL_CFG(test_file)
+    lsu_cfg.parse_verilog()
+    while True:
+        target = input()
+        
+
+test()
